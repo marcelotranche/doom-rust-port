@@ -1,0 +1,5 @@
+/references
+/target
+Cargo.lock
+*.wad
+*.WAD
