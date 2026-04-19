@@ -75,7 +75,7 @@ branches de feature/fase criadas a partir dela.
 - [x] Fase 1: WAD loader
 - [x] Fase 2: Matematica e tipos base
 - [x] Fase 3: Map loader (BSP)
-- [ ] Fase 4: Renderer
+- [x] Fase 4: Renderer
 - [ ] Fase 5: Game loop e input
 - [ ] Fase 6: Coisas e colisao
 - [ ] Fase 7: Audio
