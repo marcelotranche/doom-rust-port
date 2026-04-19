@@ -1,0 +1,45 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo run*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo init*)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Read",
+      "Glob",
+      "Grep"
+    ],
+    "deny": [
+      "Write(./references/**)",
+      "Edit(./references/**)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$TOOL_INPUT_PATH\" | grep -q '\\.rs$'; then cd \"$CLAUDE_PROJECT_DIR\" && cargo fmt -- \"$TOOL_INPUT_PATH\" 2>/dev/null; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && echo '--- Verificacao automatica ---' && cargo clippy --quiet 2>&1 | tail -5 && echo '---' && cargo test --quiet 2>&1 | tail -3"
+          }
+        ]
+      }
+    ]
+  }
+}
