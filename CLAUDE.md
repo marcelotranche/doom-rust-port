@@ -55,20 +55,26 @@ do DOOM quanto a linguagem Rust simultaneamente.
 - `cargo clippy` — lint
 - `cargo run -- --iwad assets/freedoom.wad` — executar
 
-### Git Workflow
+### Git Workflow (OneFlow)
+Baseado no modelo OneFlow: uma unica branch principal (`main`) com
+branches de feature/fase criadas a partir dela.
+
+- Branch principal: `main` — unica branch de longa duracao
 - Cada fase do port tem sua propria branch: `fase-N-descricao`
   (ex: `fase-2-matematica-tabelas`)
-- Ao concluir uma fase, criar PR via `gh pr create` para revisao
+- Branches de fase sao criadas a partir de `main` e merged de volta
+- Ao concluir uma fase, criar PR via `gh pr create --base main`
 - NAO fazer merge automaticamente — aguardar aprovacao do usuario
 - So iniciar a proxima fase apos o PR ser aprovado/merged
 - Commits na branch devem passar em `cargo clippy` e `cargo test`
+- Sem branches develop, release ou hotfix — simplicidade do OneFlow
 
 ## Progresso do Port
 <!-- Claude atualiza esta secao automaticamente -->
 - [x] Fase 0: Setup e analise
 - [x] Fase 1: WAD loader
 - [x] Fase 2: Matematica e tipos base
-- [ ] Fase 3: Map loader (BSP)
+- [x] Fase 3: Map loader (BSP)
 - [ ] Fase 4: Renderer
 - [ ] Fase 5: Game loop e input
 - [ ] Fase 6: Coisas e colisao
