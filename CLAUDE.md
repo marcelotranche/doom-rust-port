@@ -67,7 +67,7 @@ do DOOM quanto a linguagem Rust simultaneamente.
 <!-- Claude atualiza esta secao automaticamente -->
 - [x] Fase 0: Setup e analise
 - [x] Fase 1: WAD loader
-- [ ] Fase 2: Matematica e tipos base
+- [x] Fase 2: Matematica e tipos base
 - [ ] Fase 3: Map loader (BSP)
 - [ ] Fase 4: Renderer
 - [ ] Fase 5: Game loop e input

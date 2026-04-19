@@ -12,3 +12,5 @@
 pub mod angle;
 pub mod bbox;
 pub mod fixed;
+pub mod random;
+pub mod tables;
