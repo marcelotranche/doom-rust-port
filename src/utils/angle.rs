@@ -14,8 +14,6 @@
 
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
-use super::fixed::Fixed;
-
 /// Angulo no formato BAM (Binary Angle Measurement) de 32 bits.
 ///
 /// No DOOM original: `typedef unsigned angle_t;` em `tables.h`
@@ -120,32 +118,8 @@ pub const FINEMASK: usize = FINEANGLES - 1;
 /// C original: `#define ANGLETOFINESHIFT 19` em `tables.h`
 pub const ANGLETOFINESHIFT: u32 = 19;
 
-/// Tabela de seno com valores em Fixed-point.
-///
-/// No DOOM original, esta tabela e gerada pelo utilitario `makefine`
-/// e hardcoded em `tables.c`. Aqui geramos em tempo de compilacao.
-///
-/// A tabela tem 10240 entradas: 8192 para seno + 2048 extras que
-/// servem como tabela de cosseno (cos(x) = sin(x + 90)).
-///
-/// TODO: Implementar geracao da tabela completa a partir dos valores
-/// do DOOM original para garantir compatibilidade bit-a-bit.
-pub fn fine_sine(index: usize) -> Fixed {
-    // Placeholder: calcula usando f64 e converte para Fixed.
-    // Na implementacao final, usar a tabela hardcoded do DOOM para
-    // garantir resultados identicos ao original.
-    let angle_rad = (index as f64 / FINEANGLES as f64) * std::f64::consts::TAU;
-    let value = angle_rad.sin();
-    Fixed::from_raw((value * super::fixed::FRACUNIT as f64) as i32)
-}
-
-/// Tabela de cosseno — simplesmente seno deslocado em 90 graus.
-///
-/// C original: `finecosine = &finesine[FINEANGLES/4]` em `tables.c`
-/// (cosine e um ponteiro para 2048 posicoes adiante na tabela de seno)
-pub fn fine_cosine(index: usize) -> Fixed {
-    fine_sine(index + FINEANGLES / 4)
-}
+// As funcoes trigonometricas (fine_sine, fine_cosine, fine_tangent)
+// e as tabelas hardcoded do DOOM original estao em `tables.rs`.
 
 #[cfg(test)]
 mod tests {
@@ -163,28 +137,5 @@ mod tests {
     #[test]
     fn angle_sub() {
         assert_eq!(Angle::ANG90 - Angle::ANG90, Angle::ANG0);
-    }
-
-    /// Verifica que seno de 0 e aproximadamente 0
-    #[test]
-    fn sine_zero() {
-        let s = fine_sine(0);
-        assert!(s.raw().abs() < 2, "sin(0) deveria ser ~0, obteve {}", s);
-    }
-
-    /// Verifica que seno de 90 graus e aproximadamente 1.0 (FRACUNIT)
-    #[test]
-    fn sine_90() {
-        let s = fine_sine(FINEANGLES / 4); // 90 graus
-        let diff = (s.raw() - super::super::fixed::FRACUNIT).abs();
-        assert!(diff < 2, "sin(90) deveria ser ~1.0, obteve {}", s);
-    }
-
-    /// Verifica que cosseno de 0 e aproximadamente 1.0
-    #[test]
-    fn cosine_zero() {
-        let c = fine_cosine(0);
-        let diff = (c.raw() - super::super::fixed::FRACUNIT).abs();
-        assert!(diff < 2, "cos(0) deveria ser ~1.0, obteve {}", c);
     }
 }
