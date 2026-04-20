@@ -78,7 +78,7 @@ branches de feature/fase criadas a partir dela.
 - [x] Fase 4: Renderer
 - [x] Fase 5: Game loop e input
 - [x] Fase 6: Coisas e colisao
-- [ ] Fase 7: Audio
+- [x] Fase 7: Audio
 - [ ] Fase 8: Menus e HUD
 - [ ] Fase 9: Networking
 - [ ] Fase 10: Polish e freedoom jogavel
