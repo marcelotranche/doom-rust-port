@@ -183,12 +183,16 @@ impl RenderState {
 
     /// Inicializa as tabelas de projecao (viewangletox, xtoviewangle).
     ///
-    /// C original: partes de `R_InitTextureMapping()` em `r_main.c`
+    /// C original: `R_InitTextureMapping()` em `r_main.c`
     fn init_tables(&mut self) {
-        let fov_tangent = fine_tangent(FIELDOFVIEW);
-        let focallength = Fixed::from_int(SCREENWIDTH as i32 / 2) / fov_tangent;
+        // focallength = FixedDiv(centerxfrac, finetangent[FINEANGLES/4 + FIELDOFVIEW/2])
+        // Indice: 2048 + 1024 = 3072 para FOV de 90 graus
+        let fov_tangent = fine_tangent(FINEANGLES / 4 + FIELDOFVIEW / 2);
+        let focallength = self.centerxfrac / fov_tangent;
 
         // Mapear angulos para colunas X
+        // t = FixedMul(finetangent[i], focallength)
+        // viewangletox[i] = (centerxfrac - t + FRACUNIT - 1) >> FRACBITS
         for i in 0..FINEANGLES / 2 {
             let tangent = fine_tangent(i);
             let t = if tangent.0 > FRACUNIT * 2 {
@@ -196,14 +200,16 @@ impl RenderState {
             } else if tangent.0 < -FRACUNIT * 2 {
                 (SCREENWIDTH + 1) as i32
             } else {
-                let t = focallength / tangent;
-                let x = self.centerx - t.to_int();
+                // FixedMul(tangent, focallength)
+                let t = (tangent * focallength).0;
+                let x = (self.centerxfrac.0 - t + FRACUNIT - 1) >> FRACBITS;
                 x.clamp(-1, (SCREENWIDTH + 1) as i32)
             };
             self.viewangletox[i] = t;
         }
 
-        // Construir xtoviewangle (inverso)
+        // Construir xtoviewangle (inverso):
+        // Para cada coluna X, encontrar o menor angulo que mapeia para X
         for x in 0..=SCREENWIDTH {
             let mut i = 0;
             while i < FINEANGLES / 2 && self.viewangletox[i] > x as i32 {
@@ -211,6 +217,16 @@ impl RenderState {
             }
             let angle_raw = ((i as u32) << ANGLETOFINESHIFT).wrapping_sub(Angle::ANG90.0);
             self.xtoviewangle[x] = Angle(angle_raw);
+        }
+
+        // Fencepost correction: remover sentinelas de viewangletox
+        // C original: loop final de R_InitTextureMapping
+        for i in 0..FINEANGLES / 2 {
+            if self.viewangletox[i] == -1 {
+                self.viewangletox[i] = 0;
+            } else if self.viewangletox[i] == (SCREENWIDTH + 1) as i32 {
+                self.viewangletox[i] = SCREENWIDTH as i32;
+            }
         }
 
         // Clip angle

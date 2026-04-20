@@ -31,9 +31,27 @@
 use crate::map::types::NF_SUBSECTOR;
 use crate::map::MapData;
 use crate::renderer::state::RenderState;
-use crate::utils::angle::Angle;
+use crate::utils::angle::{Angle, ANGLETOFINESHIFT};
 use crate::utils::fixed::Fixed;
 use crate::video::SCREENWIDTH;
+
+/// Segmento de parede visivel coletado durante travessia BSP.
+///
+/// Armazena as informacoes necessarias para renderizar o segmento
+/// na fase de rendering (perspectiva e colunas).
+///
+/// C original: dados combinados de `curline`, `rw_angle1`, `rw_x`, `rw_stopx`
+#[derive(Debug, Clone, Copy)]
+pub struct WallSegment {
+    /// Indice do seg no array de segs do mapa
+    pub seg_index: usize,
+    /// Range de colunas X na tela (x1..=x2)
+    pub x1: i32,
+    pub x2: i32,
+    /// Angulo da camera ao primeiro vertice do seg (antes de clipping FOV).
+    /// C original: `rw_angle1` em `r_segs.c`
+    pub angle1: Angle,
+}
 
 /// Numero maximo de solid segments para clipping.
 ///
@@ -59,9 +77,17 @@ pub struct BspTraversal {
     /// C original: `cliprange_t solidsegs[MAXSEGS]` em `r_bsp.c`
     solid_segs: Vec<ClipRange>,
 
-    /// Numero de wall ranges armazenados (stubs para R_StoreWallRange).
-    /// Sera substituido por drawsegs no futuro.
-    pub wall_ranges: Vec<(i32, i32)>,
+    /// Segmentos de parede visiveis coletados para rendering.
+    /// Cada segmento contem o indice do seg e o range de colunas.
+    pub wall_ranges: Vec<WallSegment>,
+
+    /// Indice do seg sendo processado no momento.
+    /// C original: `curline` em `r_bsp.c`
+    current_seg_index: usize,
+
+    /// Angulo da camera ao v1 do seg atual (antes de FOV clipping).
+    /// C original: `rw_angle1` em `r_segs.c`
+    current_angle1: Angle,
 }
 
 impl BspTraversal {
@@ -70,6 +96,8 @@ impl BspTraversal {
         BspTraversal {
             solid_segs: Vec::with_capacity(MAXSEGS),
             wall_ranges: Vec::new(),
+            current_seg_index: 0,
+            current_angle1: Angle::ANG0,
         }
     }
 
@@ -177,6 +205,11 @@ impl BspTraversal {
         let angle1 = state.point_to_angle(v1.x, v1.y);
         let angle2 = state.point_to_angle(v2.x, v2.y);
 
+        // Guardar contexto para store_wall_range
+        // C original: rw_angle1 = angle1 (antes do clipping FOV)
+        self.current_seg_index = seg_index;
+        self.current_angle1 = angle1;
+
         // Backface culling: se o span >= 180 graus, esta virado para longe
         let span = angle1 - angle2;
         if span.0 >= Angle::ANG180.0 {
@@ -218,19 +251,36 @@ impl BspTraversal {
         };
 
         let x1 = angletox(a1 + Angle::ANG90);
-        let x2 = angletox(a2 + Angle::ANG90) - 1;
+        let x2 = angletox(a2 + Angle::ANG90);
 
-        if x1 > x2 {
+        // "Does not cross a pixel?" — C original: if (x1 == x2) return;
+        if x1 == x2 {
             return;
         }
 
-        // Determinar se e parede solida (one-sided) ou com janela
-        let is_solid = seg.back_sector.is_none();
+        // Determinar se e parede solida, porta fechada, janela, ou trigger
+        // C original: R_AddLine linhas 320-356 em r_bsp.c
+        if let Some(back_idx) = seg.back_sector {
+            let front = &map.sectors[seg.front_sector];
+            let back = &map.sectors[back_idx];
 
-        if is_solid {
-            self.clip_solid_wall_segment(x1, x2);
+            // Porta fechada: back ceiling <= front floor ou back floor >= front ceiling
+            if back.ceiling_height.0 <= front.floor_height.0
+                || back.floor_height.0 >= front.ceiling_height.0
+            {
+                self.clip_solid_wall_segment(x1, x2 - 1);
+            }
+            // Janela (alturas diferentes) ou luz diferente — parede parcial
+            else if back.ceiling_height != front.ceiling_height
+                || back.floor_height != front.floor_height
+                || front.light_level != back.light_level
+            {
+                self.clip_pass_wall_segment(x1, x2 - 1);
+            }
+            // Setores identicos (mesma altura, luz) — trigger line, ignorar
         } else {
-            self.clip_pass_wall_segment(x1, x2);
+            // One-sided = parede solida
+            self.clip_solid_wall_segment(x1, x2 - 1);
         }
     }
 
@@ -353,72 +403,135 @@ impl BspTraversal {
 
     /// Armazena um range de parede visivel para rendering posterior.
     ///
-    /// No DOOM original, `R_StoreWallRange()` inicia o rendering do
-    /// segmento de parede (texturas, floor/ceiling clips). Aqui,
-    /// apenas armazenamos o range para implementacao futura.
+    /// Coleta o segmento com indice do seg e angulo para que o
+    /// rendering possa calcular perspectiva e texturas.
     ///
     /// C original: `R_StoreWallRange()` em `r_segs.c`
     fn store_wall_range(&mut self, start: i32, stop: i32) {
         if start <= stop {
-            self.wall_ranges.push((start, stop));
+            self.wall_ranges.push(WallSegment {
+                seg_index: self.current_seg_index,
+                x1: start,
+                x2: stop,
+                angle1: self.current_angle1,
+            });
         }
     }
 
     /// Verifica se um bounding box e potencialmente visivel.
     ///
-    /// Calcula os angulos dos cantos do bbox relativos a camera
-    /// e verifica se alguma parte esta dentro do FOV.
+    /// Calcula os angulos dos cantos do bbox relativos a camera,
+    /// clippa contra o FOV, converte para colunas X, e verifica
+    /// contra os solid segs existentes.
     ///
     /// C original: `R_CheckBBox()` em `r_bsp.c`
     fn check_bbox(&self, bbox: &[Fixed; 4], state: &RenderState) -> bool {
-        // bbox: [top, bottom, left, right]
-        let top = bbox[0];
-        let bottom = bbox[1];
-        let left = bbox[2];
-        let right = bbox[3];
+        // bbox: [top(0), bottom(1), left(2), right(3)]
+        // Tabela de lookup dos cantos: C original `checkcoord[12][4]`
+        // Indices: boxx = 0(left), 1(inside), 2(right)
+        //          boxy = 0(top), 1(inside), 2(bottom)
+        //          boxpos = boxy*4 + boxx
+        const CHECKCOORD: [[usize; 4]; 12] = [
+            [3, 0, 2, 1], // boxpos=0: right,top -> left,bottom
+            [3, 0, 2, 0], // boxpos=1: right,top -> left,top
+            [3, 1, 2, 0], // boxpos=2: right,bottom -> left,top
+            [0, 0, 0, 0], // boxpos=3: unused
+            [2, 0, 2, 1], // boxpos=4: left,top -> left,bottom
+            [0, 0, 0, 0], // boxpos=5: inside (handled separately)
+            [3, 1, 3, 0], // boxpos=6: right,bottom -> right,top
+            [0, 0, 0, 0], // boxpos=7: unused
+            [2, 0, 3, 1], // boxpos=8: left,top -> right,bottom
+            [2, 1, 3, 1], // boxpos=9: left,bottom -> right,bottom
+            [2, 1, 3, 0], // boxpos=10: left,bottom -> right,top
+            [0, 0, 0, 0], // boxpos=11: unused
+        ];
 
-        // Determinar quais cantos do bbox testar
-        // baseado na posicao da camera relativa ao bbox
-        let (bx1, by1, bx2, by2) = if state.viewx.0 <= left.0 {
-            if state.viewy.0 <= bottom.0 {
-                (left, top, right, bottom)
-            } else if state.viewy.0 >= top.0 {
-                (right, top, left, bottom)
-            } else {
-                (left, top, left, bottom)
-            }
-        } else if state.viewx.0 >= right.0 {
-            if state.viewy.0 <= bottom.0 {
-                (left, bottom, right, top)
-            } else if state.viewy.0 >= top.0 {
-                (right, bottom, left, top)
-            } else {
-                (right, top, right, bottom)
-            }
-        } else if state.viewy.0 <= bottom.0 {
-            (left, bottom, right, bottom)
-        } else if state.viewy.0 >= top.0 {
-            (right, top, left, top)
+        let boxx = if state.viewx.0 <= bbox[2].0 {
+            0 // left of bbox
+        } else if state.viewx.0 < bbox[3].0 {
+            1 // inside bbox horizontally
         } else {
-            // Camera dentro do bbox — sempre visivel
-            return true;
+            2 // right of bbox
         };
 
-        let angle1 = state.point_to_angle(bx1, by1) - state.viewangle;
-        let angle2 = state.point_to_angle(bx2, by2) - state.viewangle;
+        let boxy = if state.viewy.0 >= bbox[0].0 {
+            0 // above bbox
+        } else if state.viewy.0 > bbox[1].0 {
+            1 // inside bbox vertically
+        } else {
+            2 // below bbox
+        };
+
+        let boxpos = boxy * 4 + boxx;
+        if boxpos == 5 {
+            return true; // Camera dentro do bbox
+        }
+
+        let cc = &CHECKCOORD[boxpos];
+        let x1 = bbox[cc[0]];
+        let y1 = bbox[cc[1]];
+        let x2 = bbox[cc[2]];
+        let y2 = bbox[cc[3]];
+
+        let mut angle1 = state.point_to_angle(x1, y1) - state.viewangle;
+        let angle2_raw = state.point_to_angle(x2, y2) - state.viewangle;
+        let mut angle2 = angle2_raw;
 
         let span = angle1 - angle2;
 
-        // Se span >= 180 graus, o bbox esta atras da camera
+        // Sitting on a line?
         if span.0 >= Angle::ANG180.0 {
-            return true; // Considerar visivel por seguranca
+            return true;
         }
 
+        let clip2 = state.clipangle + state.clipangle;
+
+        // Clip lado esquerdo
         let tspan = angle1 + state.clipangle;
-        if tspan.0 > (state.clipangle + state.clipangle).0 {
-            let excess = tspan - (state.clipangle + state.clipangle);
+        if tspan.0 > clip2.0 {
+            let excess = tspan - clip2;
             if excess.0 >= span.0 {
-                return false;
+                return false; // Totalmente fora do FOV esquerdo
+            }
+            angle1 = state.clipangle;
+        }
+
+        // Clip lado direito
+        let tspan = state.clipangle - angle2;
+        if tspan.0 > clip2.0 {
+            let excess = tspan - clip2;
+            if excess.0 >= span.0 {
+                return false; // Totalmente fora do FOV direito
+            }
+            angle2 = Angle(0u32.wrapping_sub(state.clipangle.0));
+        }
+
+        // Converter angulos para colunas X na tela
+        let sx1_idx = ((angle1 + Angle::ANG90).0 >> ANGLETOFINESHIFT) as usize;
+        let sx2_idx = ((angle2 + Angle::ANG90).0 >> ANGLETOFINESHIFT) as usize;
+        let sx1 = if sx1_idx < state.viewangletox.len() {
+            state.viewangletox[sx1_idx]
+        } else {
+            0
+        };
+        let sx2 = if sx2_idx < state.viewangletox.len() {
+            state.viewangletox[sx2_idx]
+        } else {
+            0
+        };
+
+        // Does not cross a pixel
+        if sx1 == sx2 {
+            return false;
+        }
+        let sx2 = sx2 - 1;
+
+        // Verificar contra solid segs
+        // Se o range inteiro [sx1, sx2] esta coberto por um unico solid seg,
+        // entao esta totalmente ocluido
+        for seg in &self.solid_segs {
+            if seg.last >= sx2 {
+                return !(sx1 >= seg.first && sx2 <= seg.last);
             }
         }
 
@@ -462,7 +575,8 @@ mod tests {
         assert_eq!(bsp.solid_segs[1].first, 10);
         assert_eq!(bsp.solid_segs[1].last, 20);
         assert_eq!(bsp.wall_ranges.len(), 1);
-        assert_eq!(bsp.wall_ranges[0], (10, 20));
+        assert_eq!(bsp.wall_ranges[0].x1, 10);
+        assert_eq!(bsp.wall_ranges[0].x2, 20);
     }
 
     /// Verifica clip_solid: dois segmentos sem sobreposicao.

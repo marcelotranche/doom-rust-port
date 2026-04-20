@@ -51,8 +51,12 @@ use crate::game::ticker::{GameTicker, TickResult};
 use crate::game::thinker::ThinkerList;
 use crate::map::MapData;
 use crate::menu::navigation::{MenuAction, MenuSystem};
+use crate::renderer::bsp::{BspTraversal, WallSegment};
 use crate::renderer::state::RenderState;
-use crate::video::VideoSystem;
+use crate::utils::angle::{Angle, ANGLETOFINESHIFT, FINEMASK};
+use crate::utils::fixed::{Fixed, FRACBITS, FRACUNIT};
+use crate::utils::tables::{fine_cosine, fine_sine};
+use crate::video::{VideoSystem, SCREENHEIGHT, SCREENWIDTH};
 use crate::wad::WadSystem;
 
 /// Versao do engine.
@@ -95,14 +99,19 @@ pub struct DoomEngine {
     /// Estado do efeito wipe
     pub wipe: WipeState,
 
-    // -- Posicao do jogador (para automap) --
+    // -- Posicao do jogador --
 
-    /// Posicao X do jogador no mapa (inteiro, unidades de mapa)
-    pub player_x: i32,
-    /// Posicao Y do jogador no mapa
-    pub player_y: i32,
-    /// Angulo do jogador em graus (0-359)
-    pub player_angle: i32,
+    /// Posicao X do jogador no mapa (fixed-point, 16.16)
+    ///
+    /// C original: `player->mo->x` (fixed_t)
+    pub player_x: Fixed,
+    /// Posicao Y do jogador no mapa (fixed-point, 16.16)
+    pub player_y: Fixed,
+    /// Angulo do jogador em BAM (Binary Angle Measurement, u32)
+    ///
+    /// C original: `player->mo->angle` (angle_t, unsigned 32-bit)
+    /// 0x00000000 = leste, 0x40000000 = norte, 0x80000000 = oeste
+    pub player_angle: u32,
 
     // -- Flags de controle --
 
@@ -139,9 +148,9 @@ impl DoomEngine {
             map: None,
             display_config: DisplayConfig::default(),
             wipe: WipeState::new(),
-            player_x: 0,
-            player_y: 0,
-            player_angle: 90,
+            player_x: Fixed(0),
+            player_y: Fixed(0),
+            player_angle: Angle::ANG90.0, // 90 graus = norte
             devparm: false,
             nomonsters: false,
             fastparm: false,
@@ -548,9 +557,12 @@ impl DoomEngine {
         if let Some(ref map) = self.map {
             // Thing type 1 = Player 1 start
             if let Some(start) = map.things.iter().find(|t| t.thing_type == 1) {
-                self.player_x = start.x.to_int();
-                self.player_y = start.y.to_int();
-                self.player_angle = start.angle as i32;
+                self.player_x = start.x;
+                self.player_y = start.y;
+                // Converter angulo de graus (0-360) para BAM
+                // C original: ANG45 * (mthing->angle / 45)
+                let deg = ((start.angle as i32 % 360 + 360) % 360) as u64;
+                self.player_angle = (deg * 0x1_0000_0000u64 / 360) as u32;
             }
         }
     }
@@ -568,46 +580,51 @@ impl DoomEngine {
         let cmd = self.game.localcmds[slot];
 
         // Rotacao (P_MovePlayer: mo->angle += cmd->angleturn<<16)
-        self.player_angle = (self.player_angle + cmd.angleturn as i32 / 16) % 360;
-        if self.player_angle < 0 {
-            self.player_angle += 360;
-        }
+        // angleturn ja esta no formato correto — basta shift left 16 para BAM
+        self.player_angle = self.player_angle.wrapping_add((cmd.angleturn as u32) << 16);
 
-        // Calcular deslocamento desejado
-        let mut dx: f64 = 0.0;
-        let mut dy: f64 = 0.0;
+        // Calcular deslocamento usando tabelas do DOOM (fixed-point)
+        // C original: P_MovePlayer em p_user.c
+        //   thrust = forwardmove * 2048
+        //   P_Thrust(player, angle, thrust)
+        //     -> mo->momx += FixedMul(move, finecosine[angle])
+        //     -> mo->momy += FixedMul(move, finesine[angle])
+        let mut momx = Fixed(0);
+        let mut momy = Fixed(0);
 
         if cmd.forwardmove != 0 {
-            let angle_rad = (self.player_angle as f64) * std::f64::consts::PI / 180.0;
-            let speed = cmd.forwardmove as f64 * 2.0;
-            dx += speed * angle_rad.cos();
-            dy += speed * angle_rad.sin();
+            let fine_angle = (self.player_angle >> ANGLETOFINESHIFT) as usize & FINEMASK;
+            let thrust = Fixed(cmd.forwardmove as i32 * 2048);
+            momx += thrust * fine_cosine(fine_angle);
+            momy += thrust * fine_sine(fine_angle);
         }
 
         if cmd.sidemove != 0 {
-            let angle_rad = ((self.player_angle - 90) as f64) * std::f64::consts::PI / 180.0;
-            let speed = cmd.sidemove as f64 * 2.0;
-            dx += speed * angle_rad.cos();
-            dy += speed * angle_rad.sin();
+            // Strafe: angulo - 90 graus (ANG90 = 0x40000000)
+            let strafe_angle = self.player_angle.wrapping_sub(Angle::ANG90.0);
+            let fine_angle = (strafe_angle >> ANGLETOFINESHIFT) as usize & FINEMASK;
+            let thrust = Fixed(cmd.sidemove as i32 * 2048);
+            momx += thrust * fine_cosine(fine_angle);
+            momy += thrust * fine_sine(fine_angle);
         }
 
-        if dx == 0.0 && dy == 0.0 {
+        if momx.0 == 0 && momy.0 == 0 {
             return;
         }
 
-        let new_x = self.player_x + dx as i32;
-        let new_y = self.player_y + dy as i32;
+        let new_x = self.player_x + momx;
+        let new_y = self.player_y + momy;
 
         // Raio do jogador (16 unidades, como no DOOM original)
         let radius = 16;
 
         // P_TryMove: checar colisao com linedefs do mapa
-        if self.check_line_collision(new_x, new_y, radius) {
+        if self.check_line_collision(new_x.to_int(), new_y.to_int(), radius) {
             // Bloqueado — tentar slide em cada eixo separadamente
             // (simplificacao de P_SlideMove)
-            if !self.check_line_collision(new_x, self.player_y, radius) {
+            if !self.check_line_collision(new_x.to_int(), self.player_y.to_int(), radius) {
                 self.player_x = new_x;
-            } else if !self.check_line_collision(self.player_x, new_y, radius) {
+            } else if !self.check_line_collision(self.player_x.to_int(), new_y.to_int(), radius) {
                 self.player_y = new_y;
             }
             // Se ambos bloqueados, nao mover
@@ -708,7 +725,7 @@ impl DoomEngine {
     fn d_display(&mut self) {
         match self.game.state {
             GameStateType::Level => {
-                self.draw_automap();
+                self.render_player_view();
             }
             GameStateType::DemoScreen => {
                 self.draw_title_screen();
@@ -863,12 +880,14 @@ impl DoomEngine {
     }
 
     /// Desenha uma vista automap (top-down) do mapa carregado.
+    /// Mantido para futuro toggle via tecla TAB.
     ///
     /// Renderiza as linedefs do mapa como linhas coloridas no
     /// framebuffer, similar ao automap do DOOM (tecla TAB).
     /// Paredes one-sided em vermelho, two-sided em cinza/marrom.
     ///
     /// C original: `AM_Drawer()` em `am_map.c`
+    #[allow(dead_code)]
     fn draw_automap(&mut self) {
         let w = crate::video::SCREENWIDTH;
         let h = crate::video::SCREENHEIGHT;
@@ -920,8 +939,8 @@ impl DoomEngine {
         // Centralizar no jogador
         let center_x = w as i32 / 2;
         let center_y = h as i32 / 2;
-        let px = self.player_x;
-        let py = self.player_y;
+        let px = self.player_x.to_int();
+        let py = self.player_y.to_int();
 
         // Converter coordenada do mapa para pixel na tela
         let to_screen = |mx: i32, my: i32| -> (i32, i32) {
@@ -942,7 +961,7 @@ impl DoomEngine {
 
         // Posicao do jogador na tela (sempre no centro)
         let player_screen = to_screen(px, py);
-        let player_angle = self.player_angle;
+        let player_angle_bam = self.player_angle;
 
         let screen = self.video.screen_mut(0);
 
@@ -958,7 +977,8 @@ impl DoomEngine {
         }
 
         // Desenhar seta do jogador (triangulo apontando na direcao do angulo)
-        let angle_rad = (player_angle as f64) * std::f64::consts::PI / 180.0;
+        // Converter BAM para radianos: BAM / 2^32 * 2*PI
+        let angle_rad = (player_angle_bam as f64) * (2.0 * std::f64::consts::PI) / 4_294_967_296.0;
         let arrow_len: f64 = 8.0;
         let (psx, psy) = player_screen;
 
@@ -979,6 +999,451 @@ impl DoomEngine {
         draw_line(screen, w, h, tip_x, tip_y, b1x, b1y, 0x04);
         draw_line(screen, w, h, tip_x, tip_y, b2x, b2y, 0x04);
         draw_line(screen, w, h, b1x, b1y, b2x, b2y, 0x04);
+    }
+
+    /// Renderiza a cena 3D em primeira pessoa.
+    ///
+    /// Implementa o pipeline de rendering do DOOM:
+    /// 1. Configurar camera (R_SetupFrame)
+    /// 2. Travessia BSP (R_RenderBSPNode) para coletar paredes visiveis
+    /// 3. Renderizar paredes com perspectiva coluna-a-coluna
+    /// 4. Preencher pisos e tetos com cores planas
+    ///
+    /// C original: `R_RenderPlayerView()` em `r_main.c`
+    fn render_player_view(&mut self) {
+        // 1. Configurar camera a partir da posicao do jogador
+        self.setup_camera();
+
+        // 2. Preencher framebuffer com teto e piso padrao
+        {
+            let screen = self.video.screen_mut(0);
+            let center_y = SCREENHEIGHT / 2;
+            for y in 0..SCREENHEIGHT {
+                // Teto escuro acima, piso marrom abaixo
+                let color: u8 = if y < center_y { 0x00 } else { 0x60 };
+                for x in 0..SCREENWIDTH {
+                    screen[y * SCREENWIDTH + x] = color;
+                }
+            }
+        }
+
+        // 3. Travessia BSP para coletar segmentos de parede visiveis
+        let mut bsp = BspTraversal::new();
+        if let Some(ref map) = self.map {
+            bsp.render_bsp(map, &self.render_state);
+        }
+
+        // 4. Renderizar paredes coletadas com perspectiva
+        let wall_segments: Vec<WallSegment> = bsp.wall_ranges.clone();
+        self.render_walls(&wall_segments);
+    }
+
+    /// Configura a camera do renderer a partir da posicao do jogador.
+    ///
+    /// Posicao ja esta em fixed-point e angulo ja esta em BAM,
+    /// entao basta atribuir diretamente ao render_state.
+    ///
+    /// C original: `R_SetupFrame()` em `r_main.c`
+    fn setup_camera(&mut self) {
+        self.render_state.viewx = self.player_x;
+        self.render_state.viewy = self.player_y;
+
+        // Altura dos olhos: piso do sector + 41 unidades (VIEWHEIGHT padrao)
+        let floor_h = self.find_player_floor_height();
+        self.render_state.viewz = Fixed::from_int(floor_h + 41);
+
+        // Angulo ja esta em BAM — atribuir diretamente
+        self.render_state.viewangle = Angle(self.player_angle);
+
+        // Pre-calcular sin/cos e incrementar contadores de frame
+        self.render_state.setup_frame();
+    }
+
+    /// Encontra a altura do piso no sector onde o jogador esta.
+    ///
+    /// Percorre a BSP tree ate encontrar o subsector que contem
+    /// a posicao do jogador, e retorna a altura do piso desse sector.
+    ///
+    /// C original: `R_PointInSubsector()` em `r_main.c`
+    fn find_player_floor_height(&self) -> i32 {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return 0,
+        };
+
+        if map.nodes.is_empty() || map.subsectors.is_empty() {
+            return 0;
+        }
+
+        let px = self.player_x;
+        let py = self.player_y;
+        let mut node_id = (map.nodes.len() - 1) as u16;
+
+        loop {
+            if node_id & crate::map::types::NF_SUBSECTOR != 0 {
+                let ss_id = (node_id & !crate::map::types::NF_SUBSECTOR) as usize;
+                if ss_id < map.subsectors.len() {
+                    let sector_idx = map.subsectors[ss_id].sector;
+                    if sector_idx < map.sectors.len() {
+                        return map.sectors[sector_idx].floor_height.to_int();
+                    }
+                }
+                return 0;
+            }
+
+            if (node_id as usize) >= map.nodes.len() {
+                return 0;
+            }
+
+            let node = &map.nodes[node_id as usize];
+            let side = RenderState::point_on_side(px, py, node);
+            node_id = node.children[side];
+        }
+    }
+
+    /// Calcula a escala perspectiva para um angulo de visao global.
+    ///
+    /// Dado o angulo de uma coluna da tela, calcula a escala na qual
+    /// a parede deve ser desenhada. Paredes mais proximas tem escala maior.
+    ///
+    /// C original: `R_ScaleFromGlobalAngle()` em `r_main.c`
+    fn scale_from_global_angle(
+        &self,
+        visangle: Angle,
+        rw_normalangle: Angle,
+        rw_distance: Fixed,
+    ) -> i32 {
+        let anglea = Angle(
+            Angle::ANG90
+                .0
+                .wrapping_add(visangle.0.wrapping_sub(self.render_state.viewangle.0)),
+        );
+        let angleb = Angle(
+            Angle::ANG90
+                .0
+                .wrapping_add(visangle.0.wrapping_sub(rw_normalangle.0)),
+        );
+
+        let sinea = fine_sine((anglea.0 >> ANGLETOFINESHIFT) as usize & FINEMASK);
+        let sineb = fine_sine((angleb.0 >> ANGLETOFINESHIFT) as usize & FINEMASK);
+
+        // num = FixedMul(projection, sineb)
+        let num = (self.render_state.projection * sineb).0;
+        // den = FixedMul(rw_distance, sinea)
+        let den = (rw_distance * sinea).0;
+
+        if den > (num >> 16) {
+            let scale = (Fixed(num) / Fixed(den)).0;
+            scale.clamp(256, 64 * FRACUNIT)
+        } else {
+            64 * FRACUNIT
+        }
+    }
+
+    /// Renderiza os segmentos de parede coletados pela travessia BSP.
+    ///
+    /// Para cada segmento visivel:
+    /// 1. Calcula a distancia perpendicular a parede
+    /// 2. Calcula a escala perspectiva coluna por coluna
+    /// 3. Desenha colunas de parede com cor baseada na luz do sector
+    /// 4. Preenche teto acima e piso abaixo da parede
+    /// 5. Atualiza arrays de clipping para oclusao correta
+    ///
+    /// C original: `R_StoreWallRange()` + `R_RenderSegLoop()` em `r_segs.c`
+    #[allow(clippy::too_many_lines)]
+    fn render_walls(&mut self, wall_segments: &[WallSegment]) {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+
+        // Arrays de clipping: controlam quais regioes da tela ja foram
+        // preenchidas por paredes mais proximas.
+        // C original: `floorclip[]`, `ceilingclip[]` em `r_plane.c`
+        let mut floorclip = vec![SCREENHEIGHT as i16; SCREENWIDTH];
+        let mut ceilingclip = vec![-1i16; SCREENWIDTH];
+
+        for ws in wall_segments {
+            if ws.seg_index >= map.segs.len() {
+                continue;
+            }
+            let seg = &map.segs[ws.seg_index];
+            if seg.front_sector >= map.sectors.len() {
+                continue;
+            }
+            let v1 = &map.vertexes[seg.v1];
+            let front_sector = &map.sectors[seg.front_sector];
+            let is_solid = seg.back_sector.is_none();
+
+            // --- Calcular rw_distance (distancia perpendicular a parede) ---
+            // C original: R_StoreWallRange em r_segs.c, linhas ~400-410
+            let rw_normalangle = Angle(seg.angle.wrapping_add(Angle::ANG90.0));
+
+            let offset_angle_raw = rw_normalangle.0.wrapping_sub(ws.angle1.0);
+            let offset_angle = if offset_angle_raw > Angle::ANG180.0 {
+                Angle(0u32.wrapping_sub(offset_angle_raw))
+            } else {
+                Angle(offset_angle_raw)
+            };
+            let offset_angle = if offset_angle.0 > Angle::ANG90.0 {
+                Angle::ANG90
+            } else {
+                offset_angle
+            };
+
+            let dist_angle = Angle(Angle::ANG90.0.wrapping_sub(offset_angle.0));
+            let hyp = self.render_state.point_to_dist(v1.x, v1.y);
+            let sineval =
+                fine_sine((dist_angle.0 >> ANGLETOFINESHIFT) as usize & FINEMASK);
+            let rw_distance = hyp * sineval;
+
+            // Proteger contra distancia zero
+            if rw_distance.0 == 0 {
+                continue;
+            }
+
+            // --- Calcular escala nas bordas do segmento ---
+            let x1 = ws.x1.max(0);
+            let x2 = ws.x2.min(SCREENWIDTH as i32 - 1);
+            if x1 > x2 {
+                continue;
+            }
+
+            let scale1 = self.scale_from_global_angle(
+                Angle(
+                    self.render_state
+                        .viewangle
+                        .0
+                        .wrapping_add(self.render_state.xtoviewangle[x1 as usize].0),
+                ),
+                rw_normalangle,
+                rw_distance,
+            );
+
+            let scale2 = if x2 > x1 {
+                self.scale_from_global_angle(
+                    Angle(
+                        self.render_state
+                            .viewangle
+                            .0
+                            .wrapping_add(self.render_state.xtoviewangle[x2 as usize].0),
+                    ),
+                    rw_normalangle,
+                    rw_distance,
+                )
+            } else {
+                scale1
+            };
+
+            let rw_scalestep = if x2 > x1 {
+                (scale2 - scale1) / (x2 - x1)
+            } else {
+                0
+            };
+
+            // --- Alturas do mundo relativas a camera (HEIGHTBITS = 12) ---
+            let worldtop =
+                (front_sector.ceiling_height.0 - self.render_state.viewz.0) >> 4;
+            let worldbottom =
+                (front_sector.floor_height.0 - self.render_state.viewz.0) >> 4;
+
+            // --- Alturas do back sector (para paredes two-sided) ---
+            let (worldhigh, worldlow) = if let Some(back_idx) = seg.back_sector {
+                if back_idx < map.sectors.len() {
+                    let back = &map.sectors[back_idx];
+                    (
+                        (back.ceiling_height.0 - self.render_state.viewz.0) >> 4,
+                        (back.floor_height.0 - self.render_state.viewz.0) >> 4,
+                    )
+                } else {
+                    (worldtop, worldbottom)
+                }
+            } else {
+                (worldtop, worldbottom)
+            };
+
+            let has_upper = !is_solid && worldhigh < worldtop;
+            let has_lower = !is_solid && worldlow > worldbottom;
+
+            // --- Cores baseadas no nivel de luz do sector ---
+            let light = (front_sector.light_level as usize).min(255);
+            let shade = (light / 16).min(15) as u8;
+            // Variacao horizontal/vertical para profundidade visual
+            let v1y = map.vertexes[seg.v1].y.0;
+            let v2y = map.vertexes[seg.v2].y.0;
+            let v1x = map.vertexes[seg.v1].x.0;
+            let v2x = map.vertexes[seg.v2].x.0;
+            let light_mod: i8 = if v1y == v2y {
+                -1 // paredes horizontais mais escuras
+            } else if v1x == v2x {
+                1 // paredes verticais mais claras
+            } else {
+                0
+            };
+            let wall_shade = (shade as i8 + light_mod).clamp(0, 15) as u8;
+            let wall_color = 0x60 + wall_shade;
+            let ceil_color = shade / 4;
+            let floor_color = 0x80 + (shade / 2).min(7);
+
+            // --- Calcular fracs e steps para interpolacao (20.12 format) ---
+            let centery4 = self.render_state.centeryfrac.0 >> 4;
+            let mut topfrac =
+                centery4 - ((worldtop as i64 * scale1 as i64) >> FRACBITS) as i32;
+            let mut bottomfrac =
+                centery4 - ((worldbottom as i64 * scale1 as i64) >> FRACBITS) as i32;
+            let topstep =
+                -((rw_scalestep as i64 * worldtop as i64) >> FRACBITS) as i32;
+            let bottomstep =
+                -((rw_scalestep as i64 * worldbottom as i64) >> FRACBITS) as i32;
+
+            // Steps para upper/lower walls (two-sided)
+            let mut pixhigh = if has_upper {
+                centery4 - ((worldhigh as i64 * scale1 as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+            let pixhighstep = if has_upper {
+                -((rw_scalestep as i64 * worldhigh as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+            let mut pixlow = if has_lower {
+                centery4 - ((worldlow as i64 * scale1 as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+            let pixlowstep = if has_lower {
+                -((rw_scalestep as i64 * worldlow as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+
+            // --- Renderizar colunas ---
+            let screen = self.video.screen_mut(0);
+            let sh = SCREENHEIGHT as i32;
+
+            for x in x1..=x2 {
+                let xu = x as usize;
+
+                // Topo da parede (front sector ceiling)
+                let mut yl = (topfrac + 0xFFF) >> 12;
+                if yl < ceilingclip[xu] as i32 + 1 {
+                    yl = ceilingclip[xu] as i32 + 1;
+                }
+
+                // Base da parede (front sector floor)
+                let mut yh = bottomfrac >> 12;
+                if yh >= floorclip[xu] as i32 {
+                    yh = floorclip[xu] as i32 - 1;
+                }
+
+                if is_solid {
+                    // --- Parede solida (one-sided) ---
+
+                    // Teto: do topo do clipping ate o topo da parede
+                    let ct = (ceilingclip[xu] as i32 + 1).max(0);
+                    let cb = (yl - 1).min(sh - 1);
+                    for y in ct..=cb {
+                        screen[y as usize * SCREENWIDTH + xu] = ceil_color;
+                    }
+
+                    // Parede
+                    let wt = yl.max(0);
+                    let wb = yh.min(sh - 1);
+                    for y in wt..=wb {
+                        screen[y as usize * SCREENWIDTH + xu] = wall_color;
+                    }
+
+                    // Piso: da base da parede ate o bottom do clipping
+                    let ft = (yh + 1).max(0);
+                    let fb = (floorclip[xu] as i32 - 1).min(sh - 1);
+                    for y in ft..=fb {
+                        screen[y as usize * SCREENWIDTH + xu] = floor_color;
+                    }
+
+                    // Marcar coluna como totalmente ocluida
+                    ceilingclip[xu] = sh as i16;
+                    floorclip[xu] = -1;
+                } else {
+                    // --- Parede two-sided ---
+
+                    // Teto do front sector (markceiling)
+                    let mark_ceiling = worldhigh != worldtop || has_upper;
+                    if mark_ceiling {
+                        let ct = (ceilingclip[xu] as i32 + 1).max(0);
+                        let cb = (yl - 1).min(sh - 1);
+                        for y in ct..=cb {
+                            screen[y as usize * SCREENWIDTH + xu] = ceil_color;
+                        }
+                    }
+
+                    // Upper wall (se back ceiling < front ceiling)
+                    if has_upper {
+                        let mut mid = pixhigh >> 12;
+                        if mid >= floorclip[xu] as i32 {
+                            mid = floorclip[xu] as i32 - 1;
+                        }
+                        if mid >= yl {
+                            let wt = yl.max(0);
+                            let wb = mid.min(sh - 1);
+                            for y in wt..=wb {
+                                screen[y as usize * SCREENWIDTH + xu] = wall_color;
+                            }
+                            ceilingclip[xu] = mid as i16;
+                        } else {
+                            ceilingclip[xu] = (yl - 1) as i16;
+                        }
+                    } else {
+                        ceilingclip[xu] = (yl - 1) as i16;
+                    }
+
+                    // Lower wall (se back floor > front floor)
+                    if has_lower {
+                        let mut mid = (pixlow + 0xFFF) >> 12;
+                        if mid <= ceilingclip[xu] as i32 {
+                            mid = ceilingclip[xu] as i32 + 1;
+                        }
+                        if mid <= yh {
+                            let wt = mid.max(0);
+                            let wb = yh.min(sh - 1);
+                            for y in wt..=wb {
+                                screen[y as usize * SCREENWIDTH + xu] = wall_color;
+                            }
+                            floorclip[xu] = mid as i16;
+                        } else {
+                            floorclip[xu] = (yh + 1) as i16;
+                        }
+                    } else {
+                        floorclip[xu] = (yh + 1) as i16;
+                    }
+
+                    // Piso do front sector (markfloor)
+                    let mark_floor = worldlow != worldbottom || has_lower;
+                    if mark_floor {
+                        let ft = (yh + 1).max(0);
+                        let old_fc = floorclip[xu] as i32;
+                        // Piso vai do bottom da abertura ate o clip anterior
+                        // Usar o floorclip antes da atualizacao pelo lower wall
+                        let fb = old_fc.min(sh);
+                        for y in ft..fb {
+                            if y >= 0 && y < sh {
+                                screen[y as usize * SCREENWIDTH + xu] =
+                                    floor_color;
+                            }
+                        }
+                    }
+                }
+
+                topfrac += topstep;
+                bottomfrac += bottomstep;
+                if has_upper {
+                    pixhigh += pixhighstep;
+                }
+                if has_lower {
+                    pixlow += pixlowstep;
+                }
+            }
+        }
     }
 
     /// Retorna o framebuffer principal (screen 0) para blit.
@@ -1021,9 +1486,11 @@ fn point_to_line_dist(px: i32, py: i32, x1: i32, y1: i32, x2: i32, y2: i32) -> f
 }
 
 /// Desenha uma linha no framebuffer usando algoritmo de Bresenham.
+/// Usado pelo automap.
 ///
 /// Clippa coordenadas contra os limites da tela antes de desenhar.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn draw_line(
     screen: &mut [u8],
     screen_w: usize,
