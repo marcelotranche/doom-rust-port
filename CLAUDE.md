@@ -80,7 +80,7 @@ branches de feature/fase criadas a partir dela.
 - [x] Fase 6: Coisas e colisao
 - [x] Fase 7: Audio
 - [x] Fase 8: Menus e HUD
-- [ ] Fase 9: Networking
+- [x] Fase 9: Networking
 - [ ] Fase 10: Polish e freedoom jogavel
 
 ## Compact Instructions
