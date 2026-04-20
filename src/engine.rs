@@ -95,6 +95,15 @@ pub struct DoomEngine {
     /// Estado do efeito wipe
     pub wipe: WipeState,
 
+    // -- Posicao do jogador (para automap) --
+
+    /// Posicao X do jogador no mapa (inteiro, unidades de mapa)
+    pub player_x: i32,
+    /// Posicao Y do jogador no mapa
+    pub player_y: i32,
+    /// Angulo do jogador em graus (0-359)
+    pub player_angle: i32,
+
     // -- Flags de controle --
 
     /// Modo desenvolvedor ativo
@@ -130,6 +139,9 @@ impl DoomEngine {
             map: None,
             display_config: DisplayConfig::default(),
             wipe: WipeState::new(),
+            player_x: 0,
+            player_y: 0,
+            player_angle: 90,
             devparm: false,
             nomonsters: false,
             fastparm: false,
@@ -266,6 +278,7 @@ impl DoomEngine {
                     engine.game.action = GameAction::Nothing;
                     engine.game.viewactive = true;
                     engine.game.levelstarttic = 0;
+                    engine.init_player_position();
                 }
                 Err(e) => {
                     log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
@@ -323,6 +336,11 @@ impl DoomEngine {
                 self.running = false;
                 return false;
             }
+        }
+
+        // Aplicar movimento do jogador (para automap interativo)
+        if self.game.state == GameStateType::Level {
+            self.apply_player_movement();
         }
 
         // Atualizar display config com base no estado
@@ -436,6 +454,7 @@ impl DoomEngine {
                         self.game.action = GameAction::Nothing;
                         self.game.viewactive = true;
                         self.game.levelstarttic = self.game.gametic;
+                        self.init_player_position();
                     }
                     Err(e) => {
                         log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
@@ -506,6 +525,7 @@ impl DoomEngine {
         // Limpar estado anterior
         self.thinkers.clear();
         self.map = Some(map);
+        self.init_player_position();
 
         // Resetar contadores
         self.game.levelstarttic = self.game.gametic;
@@ -518,6 +538,52 @@ impl DoomEngine {
         self.wipe.start(crate::video::SCREENWIDTH);
 
         Ok(())
+    }
+
+    /// Inicializa a posicao do jogador a partir do Player 1 start
+    /// thing do mapa carregado.
+    ///
+    /// C original: thing_type 1 = Player 1 start em `p_mobj.c`
+    fn init_player_position(&mut self) {
+        if let Some(ref map) = self.map {
+            // Thing type 1 = Player 1 start
+            if let Some(start) = map.things.iter().find(|t| t.thing_type == 1) {
+                self.player_x = start.x.to_int();
+                self.player_y = start.y.to_int();
+                self.player_angle = start.angle as i32;
+            }
+        }
+    }
+
+    /// Aplica o ticcmd atual para mover o jogador no automap.
+    ///
+    /// Converte forwardmove/angleturn do ticcmd em deslocamento
+    /// na posicao do jogador usando seno/cosseno do angulo.
+    fn apply_player_movement(&mut self) {
+        let slot = (self.game.gametic as usize).wrapping_sub(1) % crate::game::state::BACKUPTICS;
+        let cmd = self.game.localcmds[slot];
+
+        // Rotacao
+        self.player_angle = (self.player_angle + cmd.angleturn as i32 / 16) % 360;
+        if self.player_angle < 0 {
+            self.player_angle += 360;
+        }
+
+        // Movimento frente/tras
+        if cmd.forwardmove != 0 {
+            let angle_rad = (self.player_angle as f64) * std::f64::consts::PI / 180.0;
+            let speed = cmd.forwardmove as f64 * 2.0;
+            self.player_x += (speed * angle_rad.cos()) as i32;
+            self.player_y += (speed * angle_rad.sin()) as i32;
+        }
+
+        // Strafe esquerda/direita
+        if cmd.sidemove != 0 {
+            let angle_rad = ((self.player_angle - 90) as f64) * std::f64::consts::PI / 180.0;
+            let speed = cmd.sidemove as f64 * 2.0;
+            self.player_x += (speed * angle_rad.cos()) as i32;
+            self.player_y += (speed * angle_rad.sin()) as i32;
+        }
     }
 
     /// Retorna o numero de ticks por segundo.
@@ -749,27 +815,23 @@ impl DoomEngine {
             return;
         }
 
-        // Margem de 10 pixels em cada lado
-        let margin = 10;
-        let view_w = (w - margin * 2) as i32;
-        let view_h = (h - margin * 2) as i32;
+        // Escala fixa: ~1 pixel por unidade de mapa, centrado no jogador
+        // Zoom que mostra area de ~300 unidades de mapa na tela
+        let scale: i64 = ((w as i64) << 16) / (map_width as i64).max(1);
+        let scale_y_val: i64 = ((h as i64) << 16) / (map_height as i64).max(1);
+        let scale = scale.min(scale_y_val);
 
-        // Escala: pixels por unidade de mapa (fixed-point 16.16)
-        let scale_x = ((view_w as i64) << 16) / map_width as i64;
-        let scale_y = ((view_h as i64) << 16) / map_height as i64;
-        let scale = scale_x.min(scale_y);
-
-        // Centro do mapa na tela
+        // Centralizar no jogador
         let center_x = w as i32 / 2;
         let center_y = h as i32 / 2;
-        let map_center_x = (min_x + max_x) / 2;
-        let map_center_y = (min_y + max_y) / 2;
+        let px = self.player_x;
+        let py = self.player_y;
 
-        // Converter coordenada do mapa (inteira) para pixel na tela
+        // Converter coordenada do mapa para pixel na tela
         let to_screen = |mx: i32, my: i32| -> (i32, i32) {
-            let sx = center_x + (((mx - map_center_x) as i64 * scale) >> 16) as i32;
+            let sx = center_x + (((mx - px) as i64 * scale) >> 16) as i32;
             // Y invertido: no DOOM y cresce para cima, na tela para baixo
-            let sy = center_y - (((my - map_center_y) as i64 * scale) >> 16) as i32;
+            let sy = center_y - (((my - py) as i64 * scale) >> 16) as i32;
             (sx, sy)
         };
 
@@ -782,18 +844,45 @@ impl DoomEngine {
             (v1.x.to_int(), v1.y.to_int(), v2.x.to_int(), v2.y.to_int(), two_sided)
         }).collect();
 
+        // Posicao do jogador na tela (sempre no centro)
+        let player_screen = to_screen(px, py);
+        let player_angle = self.player_angle;
+
         let screen = self.video.screen_mut(0);
 
         for &(v1x, v1y, v2x, v2y, two_sided) in &lines {
             let (x1, y1) = to_screen(v1x, v1y);
             let (x2, y2) = to_screen(v2x, v2y);
 
-            // Cor: vermelho para one-sided, cinza escuro para two-sided
+            // Cor: vermelho para one-sided, cinza/marrom para two-sided
             let color: u8 = if two_sided { 0x60 } else { 0xAC };
 
             // Bresenham line drawing
             draw_line(screen, w, h, x1, y1, x2, y2, color);
         }
+
+        // Desenhar seta do jogador (triangulo apontando na direcao do angulo)
+        let angle_rad = (player_angle as f64) * std::f64::consts::PI / 180.0;
+        let arrow_len: f64 = 8.0;
+        let (psx, psy) = player_screen;
+
+        // Ponta da seta
+        let tip_x = psx + (arrow_len * angle_rad.cos()) as i32;
+        let tip_y = psy - (arrow_len * angle_rad.sin()) as i32;
+
+        // Dois cantos traseiros da seta
+        let back_angle1 = angle_rad + 2.5;
+        let back_angle2 = angle_rad - 2.5;
+        let back_len: f64 = 5.0;
+        let b1x = psx + (back_len * back_angle1.cos()) as i32;
+        let b1y = psy - (back_len * back_angle1.sin()) as i32;
+        let b2x = psx + (back_len * back_angle2.cos()) as i32;
+        let b2y = psy - (back_len * back_angle2.sin()) as i32;
+
+        // Cor branca (0x04 = branco brilhante na paleta DOOM)
+        draw_line(screen, w, h, tip_x, tip_y, b1x, b1y, 0x04);
+        draw_line(screen, w, h, tip_x, tip_y, b2x, b2y, 0x04);
+        draw_line(screen, w, h, b1x, b1y, b2x, b2y, 0x04);
     }
 
     /// Retorna o framebuffer principal (screen 0) para blit.
