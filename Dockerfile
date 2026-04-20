@@ -25,10 +25,11 @@ RUN mkdir src && \
     echo 'fn main() {}' > src/main.rs && \
     echo '' > src/lib.rs && \
     cargo build --release 2>/dev/null || true && \
-    rm -rf src
+    rm -rf src target/release/doom-rust target/release/deps/doom_rust-*
 
-# Copiar codigo-fonte real
+# Copiar codigo-fonte real e invalidar cache de compilacao
 COPY src/ src/
+RUN find src -name '*.rs' -exec touch {} +
 
 # Compilar em release (sem feature sdl — headless/CLI mode)
 RUN cargo build --release && \
