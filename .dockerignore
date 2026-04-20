@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+
+# Referencias C (nao necessarias para build)
+references/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# Assets locais (montados via volume)
+assets/*.wad

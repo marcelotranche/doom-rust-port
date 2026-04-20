@@ -1,0 +1,21 @@
+# =============================================================================
+# DOOM Rust — Docker Compose
+#
+# Uso basico:
+#   docker compose run --rm doom --iwad /data/freedoom1.wad --warp 1 1
+#
+# Coloque o arquivo freedoom1.wad (ou doom.wad) no diretorio ./assets/
+# =============================================================================
+
+services:
+  doom:
+    build: .
+    volumes:
+      - ./assets:/data:ro
+    ports:
+      - "5029:5029/udp"
+
+  # Servico pre-configurado para teste rapido
+  test:
+    build: .
+    command: ["--help"]
