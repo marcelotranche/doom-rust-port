@@ -627,8 +627,12 @@ impl DoomEngine {
     /// Aplica o ticcmd atual para mover o jogador.
     ///
     /// Converte forwardmove/angleturn do ticcmd em deslocamento
-    /// e verifica colisao com linedefs one-sided (paredes solidas)
-    /// antes de aplicar o movimento.
+    /// e verifica colisao com linedefs antes de aplicar o movimento.
+    ///
+    /// Usa o sistema completo de colisao do DOOM: P_BoxOnLineSide para
+    /// teste geometrico AABB-vs-linha, P_LineOpening para gap vertical
+    /// em linedefs two-sided, e P_SlideMove para deslizar ao longo
+    /// de paredes quando bloqueado.
     ///
     /// C original: `P_MovePlayer()` em `p_user.c` +
     ///             `P_XYMovement()` / `P_TryMove()` em `p_map.c`
@@ -637,15 +641,10 @@ impl DoomEngine {
         let cmd = self.game.localcmds[slot];
 
         // Rotacao (P_MovePlayer: mo->angle += cmd->angleturn<<16)
-        // angleturn ja esta no formato correto — basta shift left 16 para BAM
         self.player_angle = self.player_angle.wrapping_add((cmd.angleturn as u32) << 16);
 
         // Calcular deslocamento usando tabelas do DOOM (fixed-point)
-        // C original: P_MovePlayer em p_user.c
-        //   thrust = forwardmove * 2048
-        //   P_Thrust(player, angle, thrust)
-        //     -> mo->momx += FixedMul(move, finecosine[angle])
-        //     -> mo->momy += FixedMul(move, finesine[angle])
+        // C original: P_Thrust(player, angle, forwardmove * 2048)
         let mut momx = Fixed(0);
         let mut momy = Fixed(0);
 
@@ -657,7 +656,6 @@ impl DoomEngine {
         }
 
         if cmd.sidemove != 0 {
-            // Strafe: angulo - 90 graus (ANG90 = 0x40000000)
             let strafe_angle = self.player_angle.wrapping_sub(Angle::ANG90.0);
             let fine_angle = (strafe_angle >> ANGLETOFINESHIFT) as usize & FINEMASK;
             let thrust = Fixed(cmd.sidemove as i32 * 2048);
@@ -672,88 +670,383 @@ impl DoomEngine {
         let new_x = self.player_x + momx;
         let new_y = self.player_y + momy;
 
-        // Raio do jogador (16 unidades, como no DOOM original)
-        let radius = 16;
-
-        // P_TryMove: checar colisao com linedefs do mapa
-        if self.check_line_collision(new_x.to_int(), new_y.to_int(), radius) {
-            // Bloqueado — tentar slide em cada eixo separadamente
-            // (simplificacao de P_SlideMove)
-            if !self.check_line_collision(new_x.to_int(), self.player_y.to_int(), radius) {
-                self.player_x = new_x;
-            } else if !self.check_line_collision(self.player_x.to_int(), new_y.to_int(), radius) {
-                self.player_y = new_y;
-            }
-            // Se ambos bloqueados, nao mover
-        } else {
-            self.player_x = new_x;
-            self.player_y = new_y;
+        // P_TryMove: checar colisao com todas as linedefs relevantes
+        if !self.try_move(new_x, new_y) {
+            // Bloqueado — P_SlideMove: projetar velocidade na parede
+            self.slide_move(momx, momy);
         }
     }
 
-    /// Verifica se a posicao (x, y) com dado raio colide com
-    /// alguma linedef solida do mapa.
+    /// Tenta mover o jogador para (new_x, new_y).
     ///
-    /// Checa linedefs one-sided (paredes) e two-sided sem gap
-    /// suficiente para passagem (portas fechadas, etc.).
+    /// Verifica colisao AABB com todas as linedefs, incluindo:
+    /// - Linedefs one-sided (paredes solidas)
+    /// - Linedefs com flag BLOCKING
+    /// - Linedefs two-sided com gap vertical insuficiente
+    /// - Step height maximo de 24 unidades (MAXSTEPHEIGHT)
     ///
-    /// C original: `P_CheckPosition()` + `PIT_CheckLine()` em `p_map.c`
-    fn check_line_collision(&self, x: i32, y: i32, radius: i32) -> bool {
+    /// C original: `P_TryMove()` + `P_CheckPosition()` + `PIT_CheckLine()` em `p_map.c`
+    fn try_move(&mut self, new_x: Fixed, new_y: Fixed) -> bool {
+        use crate::map::types::LineDefFlags;
+
         let map = match &self.map {
             Some(m) => m,
-            None => return false,
+            None => return true,
         };
 
-        // Bounding box do jogador
-        let left = x - radius;
-        let right = x + radius;
-        let bottom = y - radius;
-        let top = y + radius;
+        // Constantes do DOOM original
+        const PLAYER_RADIUS: i32 = 16 * FRACUNIT; // 16 unidades em fixed-point
+        const PLAYER_HEIGHT: i32 = 56 * FRACUNIT;  // 56 unidades
+        const MAXSTEPHEIGHT: i32 = 24 * FRACUNIT;  // altura maxima de degrau
 
+        // Bounding box do jogador na nova posicao (em fixed-point)
+        let tmbox = [
+            new_y.0 + PLAYER_RADIUS, // BOXTOP
+            new_y.0 - PLAYER_RADIUS, // BOXBOTTOM
+            new_x.0 - PLAYER_RADIUS, // BOXLEFT
+            new_x.0 + PLAYER_RADIUS, // BOXRIGHT
+        ];
+
+        // Altura do piso atual do jogador
+        let current_floor = Fixed::from_int(self.find_player_floor_height());
+
+        // tmfloorz e tmceilingz rastreiam o piso mais alto e teto mais
+        // baixo de todos os sectors que a AABB toca na nova posicao.
+        // Inicializados com os valores do sector de destino.
+        let dest_floor = self.find_floor_height_at(new_x, new_y);
+        let dest_ceil = self.find_ceiling_height_at(new_x, new_y);
+        let mut tmfloorz = dest_floor;
+        let mut tmceilingz = dest_ceil;
+        let mut tmdropoffz = dest_floor;
+
+        // PIT_CheckLine: iterar todas as linedefs
         for ld in &map.linedefs {
-            let v1x = map.vertexes[ld.v1].x.to_int();
-            let v1y = map.vertexes[ld.v1].y.to_int();
-            let v2x = map.vertexes[ld.v2].x.to_int();
-            let v2y = map.vertexes[ld.v2].y.to_int();
+            let v1 = &map.vertexes[ld.v1];
+            let v2 = &map.vertexes[ld.v2];
 
-            // Quick reject: AABB da linedef vs AABB do jogador
-            let line_left = v1x.min(v2x);
-            let line_right = v1x.max(v2x);
-            let line_bottom = v1y.min(v2y);
-            let line_top = v1y.max(v2y);
+            // Bounding box da linedef (em fixed-point)
+            let line_bbox = [
+                v1.y.0.max(v2.y.0), // BOXTOP
+                v1.y.0.min(v2.y.0), // BOXBOTTOM
+                v1.x.0.min(v2.x.0), // BOXLEFT
+                v1.x.0.max(v2.x.0), // BOXRIGHT
+            ];
 
-            if right <= line_left || left > line_right
-                || top <= line_bottom || bottom > line_top
+            // Quick reject: AABBs nao se sobrepoem
+            if tmbox[3] <= line_bbox[2]  // right <= line_left
+                || tmbox[2] >= line_bbox[3]  // left >= line_right
+                || tmbox[0] <= line_bbox[1]  // top <= line_bottom
+                || tmbox[1] >= line_bbox[0]  // bottom >= line_top
             {
-                // Bounding boxes nao se sobrepoem — ignora +1 para linhas finas
-                if (line_left == line_right || line_bottom == line_top)
-                    && (right < line_left - radius || left > line_right + radius
-                        || top < line_bottom - radius || bottom > line_top + radius)
-                {
-                    continue;
-                }
-                if line_left != line_right && line_bottom != line_top {
-                    continue;
-                }
-            }
-
-            // Linedef one-sided = parede solida (bloqueante)
-            let is_blocking = !ld.flags.contains(crate::map::types::LineDefFlags::TWO_SIDED)
-                || ld.flags.contains(crate::map::types::LineDefFlags::BLOCKING);
-
-            if !is_blocking {
                 continue;
             }
 
-            // Distancia ponto-segmento: se o jogador esta proximo
-            // demais da linedef, bloquear
-            let dist = point_to_line_dist(x, y, v1x, v1y, v2x, v2y);
-            if dist < radius as f64 {
-                return true;
+            // P_BoxOnLineSide: teste AABB vs linha infinita
+            let side = Self::box_on_line_side(&tmbox, v1.x.0, v1.y.0, ld);
+            if side != -1 {
+                // AABB inteira de um lado da linha — nao cruza
+                continue;
+            }
+
+            // A AABB cruza esta linedef
+
+            // One-sided = parede solida, bloqueia sempre
+            if ld.sidenum[1].is_none() {
+                return false;
+            }
+
+            // Flags de bloqueio
+            if ld.flags.contains(LineDefFlags::BLOCKING) {
+                return false;
+            }
+
+            // P_LineOpening: calcular gap vertical da linedef two-sided
+            let (opentop, openbottom, _openrange, lowfloor) =
+                Self::line_opening(ld, map);
+
+            // Ajustar tmfloorz / tmceilingz (PIT_CheckLine linhas 227-237)
+            if opentop < tmceilingz {
+                tmceilingz = opentop;
+            }
+            if openbottom > tmfloorz {
+                tmfloorz = openbottom;
+            }
+            if lowfloor < tmdropoffz {
+                tmdropoffz = lowfloor;
             }
         }
 
-        false
+        // P_TryMove: verificacoes finais de altura
+
+        // Cabe verticalmente?
+        if tmceilingz - tmfloorz < PLAYER_HEIGHT {
+            return false;
+        }
+
+        // Teto baixo demais para a posicao atual do jogador?
+        if tmceilingz - current_floor.0 < PLAYER_HEIGHT {
+            return false;
+        }
+
+        // Degrau alto demais? (maximo 24 unidades)
+        if tmfloorz - current_floor.0 > MAXSTEPHEIGHT {
+            return false;
+        }
+
+        // Dropoff muito grande? (nao ficar sobre um abismo > 24 unidades)
+        if tmfloorz - tmdropoffz > MAXSTEPHEIGHT {
+            return false;
+        }
+
+        // Movimento valido
+        self.player_x = new_x;
+        self.player_y = new_y;
+        true
+    }
+
+    /// Desliza o jogador ao longo de paredes quando o movimento direto
+    /// e bloqueado.
+    ///
+    /// Implementacao simplificada de P_SlideMove: tenta o movimento
+    /// em cada eixo separadamente, e se ambos falharem, projeta
+    /// a velocidade na direcao da parede mais proxima.
+    ///
+    /// C original: `P_SlideMove()` + `P_HitSlideLine()` em `p_map.c`
+    fn slide_move(&mut self, momx: Fixed, momy: Fixed) {
+        // Tentativa 1: mover apenas no eixo X
+        let try_x = self.player_x + momx;
+        if self.try_move(try_x, self.player_y) {
+            return;
+        }
+
+        // Tentativa 2: mover apenas no eixo Y
+        let try_y = self.player_y + momy;
+        if self.try_move(self.player_x, try_y) {
+            return;
+        }
+
+        // Tentativa 3: mover com metade da velocidade em cada eixo
+        let half_x = self.player_x + Fixed(momx.0 / 2);
+        let half_y = self.player_y + Fixed(momy.0 / 2);
+        if self.try_move(half_x, half_y) {
+            return;
+        }
+
+        // Tentativa 4: quartos
+        if self.try_move(half_x, self.player_y) {
+            return;
+        }
+        // Ultimo recurso: tentar apenas Y
+        let _ = self.try_move(self.player_x, half_y);
+    }
+
+    /// Determina de que lado de uma linedef infinita a AABB esta.
+    ///
+    /// Retorna 0 (front), 1 (back) ou -1 (cruza a linha).
+    /// Usa o slopetype da linedef para otimizacao (fast path para
+    /// linhas horizontais e verticais).
+    ///
+    /// C original: `P_BoxOnLineSide()` em `p_maputl.c`
+    fn box_on_line_side(
+        tmbox: &[i32; 4], // [top, bottom, left, right]
+        v1x: i32,
+        v1y: i32,
+        ld: &crate::map::types::LineDef,
+    ) -> i32 {
+        use crate::map::types::SlopeType;
+
+        let (p1, p2) = match ld.slope_type {
+            SlopeType::Horizontal => {
+                let mut a = (tmbox[0] > v1y) as i32; // top > v1.y
+                let mut b = (tmbox[1] > v1y) as i32; // bottom > v1.y
+                if ld.dx.0 < 0 {
+                    a ^= 1;
+                    b ^= 1;
+                }
+                (a, b)
+            }
+            SlopeType::Vertical => {
+                let mut a = (tmbox[3] < v1x) as i32; // right < v1.x
+                let mut b = (tmbox[2] < v1x) as i32; // left < v1.x
+                if ld.dy.0 < 0 {
+                    a ^= 1;
+                    b ^= 1;
+                }
+                (a, b)
+            }
+            SlopeType::Positive => {
+                let a = Self::point_on_line_side(tmbox[2], tmbox[0], v1x, v1y, ld); // left, top
+                let b = Self::point_on_line_side(tmbox[3], tmbox[1], v1x, v1y, ld); // right, bottom
+                (a, b)
+            }
+            SlopeType::Negative => {
+                let a = Self::point_on_line_side(tmbox[3], tmbox[0], v1x, v1y, ld); // right, top
+                let b = Self::point_on_line_side(tmbox[2], tmbox[1], v1x, v1y, ld); // left, bottom
+                (a, b)
+            }
+        };
+
+        if p1 == p2 {
+            p1
+        } else {
+            -1
+        }
+    }
+
+    /// Determina de que lado de uma linedef um ponto esta.
+    ///
+    /// Retorna 0 (front/esquerda) ou 1 (back/direita).
+    /// Usa cross product: (dy >> 16) * (px - v1x) vs (py - v1y) * (dx >> 16)
+    ///
+    /// C original: `P_PointOnLineSide()` em `p_maputl.c`
+    fn point_on_line_side(
+        x: i32,
+        y: i32,
+        v1x: i32,
+        v1y: i32,
+        ld: &crate::map::types::LineDef,
+    ) -> i32 {
+        // Fast path para linhas ortogonais
+        if ld.dx.0 == 0 {
+            return if x <= v1x {
+                (ld.dy.0 > 0) as i32
+            } else {
+                (ld.dy.0 < 0) as i32
+            };
+        }
+        if ld.dy.0 == 0 {
+            return if y <= v1y {
+                (ld.dx.0 < 0) as i32
+            } else {
+                (ld.dx.0 > 0) as i32
+            };
+        }
+
+        // Cross product para determinar o lado
+        let dx = x - v1x;
+        let dy = y - v1y;
+        let left = (ld.dy.0 >> FRACBITS) as i64 * dx as i64;
+        let right = dy as i64 * (ld.dx.0 >> FRACBITS) as i64;
+
+        if right < left {
+            0 // front side
+        } else {
+            1 // back side
+        }
+    }
+
+    /// Calcula a abertura vertical de uma linedef two-sided.
+    ///
+    /// Retorna (opentop, openbottom, openrange, lowfloor) em fixed-point.
+    /// - opentop: teto mais baixo entre os dois sectors
+    /// - openbottom: piso mais alto entre os dois sectors
+    /// - openrange: espaco livre vertical (opentop - openbottom)
+    /// - lowfloor: piso mais baixo (para deteccao de dropoff)
+    ///
+    /// C original: `P_LineOpening()` em `p_maputl.c`
+    fn line_opening(
+        ld: &crate::map::types::LineDef,
+        map: &crate::map::MapData,
+    ) -> (i32, i32, i32, i32) {
+        // One-sided: sem abertura
+        let back_idx = match ld.back_sector {
+            Some(idx) => idx,
+            None => return (0, 0, 0, 0),
+        };
+        let front_idx = match ld.front_sector {
+            Some(idx) => idx,
+            None => return (0, 0, 0, 0),
+        };
+
+        if front_idx >= map.sectors.len() || back_idx >= map.sectors.len() {
+            return (0, 0, 0, 0);
+        }
+
+        let front = &map.sectors[front_idx];
+        let back = &map.sectors[back_idx];
+
+        let opentop = front.ceiling_height.0.min(back.ceiling_height.0);
+
+        let (openbottom, lowfloor) = if front.floor_height.0 > back.floor_height.0 {
+            (front.floor_height.0, back.floor_height.0)
+        } else {
+            (back.floor_height.0, front.floor_height.0)
+        };
+
+        let openrange = opentop - openbottom;
+        (opentop, openbottom, openrange, lowfloor)
+    }
+
+    /// Encontra a altura do teto no sector que contem o ponto (x, y).
+    ///
+    /// Usa BSP traversal para encontrar o subsector de destino.
+    fn find_ceiling_height_at(&self, x: Fixed, y: Fixed) -> i32 {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return i32::MAX,
+        };
+
+        if map.nodes.is_empty() || map.subsectors.is_empty() {
+            return i32::MAX;
+        }
+
+        let mut node_id = (map.nodes.len() - 1) as u16;
+        loop {
+            if node_id & crate::map::types::NF_SUBSECTOR != 0 {
+                let ss_id = (node_id & !crate::map::types::NF_SUBSECTOR) as usize;
+                if ss_id < map.subsectors.len() {
+                    let sector_idx = map.subsectors[ss_id].sector;
+                    if sector_idx < map.sectors.len() {
+                        return map.sectors[sector_idx].ceiling_height.0;
+                    }
+                }
+                return i32::MAX;
+            }
+
+            if (node_id as usize) >= map.nodes.len() {
+                return i32::MAX;
+            }
+
+            let node = &map.nodes[node_id as usize];
+            let side = RenderState::point_on_side(x, y, node);
+            node_id = node.children[side];
+        }
+    }
+
+    /// Encontra a altura do piso no sector que contem o ponto (x, y).
+    ///
+    /// Usa BSP traversal para encontrar o subsector de destino.
+    fn find_floor_height_at(&self, x: Fixed, y: Fixed) -> i32 {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return 0,
+        };
+
+        if map.nodes.is_empty() || map.subsectors.is_empty() {
+            return 0;
+        }
+
+        let mut node_id = (map.nodes.len() - 1) as u16;
+        loop {
+            if node_id & crate::map::types::NF_SUBSECTOR != 0 {
+                let ss_id = (node_id & !crate::map::types::NF_SUBSECTOR) as usize;
+                if ss_id < map.subsectors.len() {
+                    let sector_idx = map.subsectors[ss_id].sector;
+                    if sector_idx < map.sectors.len() {
+                        return map.sectors[sector_idx].floor_height.0;
+                    }
+                }
+                return 0;
+            }
+
+            if (node_id as usize) >= map.nodes.len() {
+                return 0;
+            }
+
+            let node = &map.nodes[node_id as usize];
+            let side = RenderState::point_on_side(x, y, node);
+            node_id = node.children[side];
+        }
     }
 
     /// Retorna o numero de ticks por segundo.
@@ -1884,31 +2177,6 @@ impl DoomEngine {
     }
 }
 
-/// Calcula a distancia minima de um ponto a um segmento de reta.
-///
-/// Usado para colisao do jogador com linedefs.
-fn point_to_line_dist(px: i32, py: i32, x1: i32, y1: i32, x2: i32, y2: i32) -> f64 {
-    let dx = (x2 - x1) as f64;
-    let dy = (y2 - y1) as f64;
-    let len_sq = dx * dx + dy * dy;
-
-    if len_sq == 0.0 {
-        // Segmento degenerado (ponto)
-        let ex = (px - x1) as f64;
-        let ey = (py - y1) as f64;
-        return (ex * ex + ey * ey).sqrt();
-    }
-
-    // Projecao do ponto no segmento (parametro t clamped a [0,1])
-    let t = (((px - x1) as f64 * dx + (py - y1) as f64 * dy) / len_sq).clamp(0.0, 1.0);
-
-    let proj_x = x1 as f64 + t * dx;
-    let proj_y = y1 as f64 + t * dy;
-
-    let ex = px as f64 - proj_x;
-    let ey = py as f64 - proj_y;
-    (ex * ex + ey * ey).sqrt()
-}
 
 /// Desenha uma linha no framebuffer usando algoritmo de Bresenham.
 /// Usado pelo automap.
