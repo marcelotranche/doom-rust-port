@@ -23,6 +23,9 @@
 //! - Correcao gamma via lookup table
 //! - Formato de patches do DOOM (column-based sprites)
 
+#[cfg(feature = "sdl")]
+pub mod sdl;
+
 /// Largura da tela do DOOM em pixels.
 ///
 /// C original: `#define SCREENWIDTH 320` em `doomdef.h`

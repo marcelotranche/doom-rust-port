@@ -431,6 +431,11 @@ impl DoomEngine {
         self.game.state
     }
 
+    /// Retorna o framebuffer principal (screen 0) para blit.
+    pub fn framebuffer(&self) -> &[u8] {
+        self.video.screen(0)
+    }
+
     /// Encerra o engine.
     pub fn quit(&mut self) {
         log::info!("D_QuitNetGame: Encerrando rede...");
