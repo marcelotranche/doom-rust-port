@@ -52,6 +52,8 @@ use crate::game::thinker::ThinkerList;
 use crate::map::MapData;
 use crate::menu::navigation::{MenuAction, MenuSystem};
 use crate::renderer::bsp::{BspTraversal, WallSegment};
+use crate::renderer::data::TextureData;
+use crate::renderer::draw::ColumnDrawer;
 use crate::renderer::state::RenderState;
 use crate::utils::angle::{Angle, ANGLETOFINESHIFT, FINEMASK};
 use crate::utils::fixed::{Fixed, FRACBITS, FRACUNIT};
@@ -61,6 +63,25 @@ use crate::wad::WadSystem;
 
 /// Versao do engine.
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Dados pre-calculados para rendering de planos (piso/teto).
+///
+/// Contem tabelas de projecao perspectiva e cache de texturas flat.
+/// C original: globals `yslope[]`, `distscale[]`, `basexscale`, `baseyscale`
+struct PlaneRenderData {
+    /// Lookup de projecao: distancia por linha Y.
+    /// yslope[y] = FixedDiv(viewwidth/2, abs(y - centery))
+    yslope: [i32; SCREENHEIGHT],
+    /// Escala de distancia por coluna X (correcao coseno).
+    /// distscale[x] = 1 / cos(xtoviewangle[x])
+    distscale: [i32; SCREENWIDTH],
+    /// Stepping X na textura de flat por unidade de distancia
+    #[allow(dead_code)]
+    basexscale: i32,
+    /// Stepping Y na textura de flat por unidade de distancia
+    #[allow(dead_code)]
+    baseyscale: i32,
+}
 
 /// Engine principal do DOOM.
 ///
@@ -94,6 +115,16 @@ pub struct DoomEngine {
     pub menu: MenuSystem,
     /// Dados do mapa atual (geometria, BSP, things)
     pub map: Option<MapData>,
+    /// Dados de textura carregados do WAD (patches, flats, colormaps)
+    pub texture_data: Option<TextureData>,
+    /// Drawer de colunas (lookup tables para framebuffer)
+    pub column_drawer: ColumnDrawer,
+    /// Cache de flats carregados do WAD (construido uma vez ao carregar mapa)
+    flat_cache: std::collections::HashMap<[u8; 8], Vec<u8>>,
+    /// Tabela de projecao yslope (constante, calculada uma vez na init)
+    plane_yslope: [i32; SCREENHEIGHT],
+    /// Escala de distancia por coluna (constante, calculada uma vez na init)
+    plane_distscale: [i32; SCREENWIDTH],
     /// Configuracao de exibicao
     pub display_config: DisplayConfig,
     /// Estado do efeito wipe
@@ -146,6 +177,11 @@ impl DoomEngine {
             input: InputState::new(),
             menu: MenuSystem::new(),
             map: None,
+            texture_data: None,
+            column_drawer: ColumnDrawer::new(),
+            flat_cache: std::collections::HashMap::new(),
+            plane_yslope: [0i32; SCREENHEIGHT],
+            plane_distscale: [0i32; SCREENWIDTH],
             display_config: DisplayConfig::default(),
             wipe: WipeState::new(),
             player_x: Fixed(0),
@@ -244,6 +280,24 @@ impl DoomEngine {
             crate::video::SCREENWIDTH, crate::video::SCREENHEIGHT);
 
         log::info!("R_Init: Inicializando renderer...");
+        // R_InitData: carregar texturas, flats, sprites, colormaps
+        match TextureData::load(&engine.wad) {
+            Ok(td) => {
+                log::info!(
+                    "R_InitData: {} texturas, {} flats, {} sprites",
+                    td.textures.len(),
+                    td.num_flats,
+                    td.num_sprite_lumps,
+                );
+                engine.texture_data = Some(td);
+            }
+            Err(e) => {
+                log::warn!("R_InitData: falha ao carregar texturas: {}", e);
+            }
+        }
+
+        // Pre-calcular tabelas de projecao de planos (constantes)
+        engine.init_plane_tables();
 
         log::info!("P_Init: Inicializando gameplay...");
 
@@ -288,6 +342,7 @@ impl DoomEngine {
                     engine.game.viewactive = true;
                     engine.game.levelstarttic = 0;
                     engine.init_player_position();
+                    engine.build_flat_cache();
                 }
                 Err(e) => {
                     log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
@@ -464,6 +519,7 @@ impl DoomEngine {
                         self.game.viewactive = true;
                         self.game.levelstarttic = self.game.gametic;
                         self.init_player_position();
+                        self.build_flat_cache();
                     }
                     Err(e) => {
                         log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
@@ -535,6 +591,7 @@ impl DoomEngine {
         self.thinkers.clear();
         self.map = Some(map);
         self.init_player_position();
+        self.build_flat_cache();
 
         // Resetar contadores
         self.game.levelstarttic = self.game.gametic;
@@ -1014,28 +1071,106 @@ impl DoomEngine {
         // 1. Configurar camera a partir da posicao do jogador
         self.setup_camera();
 
-        // 2. Preencher framebuffer com teto e piso padrao
+        // 2. Preencher framebuffer com cor preta (sera sobrescrito por paredes/pisos)
         {
             let screen = self.video.screen_mut(0);
-            let center_y = SCREENHEIGHT / 2;
-            for y in 0..SCREENHEIGHT {
-                // Teto escuro acima, piso marrom abaixo
-                let color: u8 = if y < center_y { 0x00 } else { 0x60 };
-                for x in 0..SCREENWIDTH {
-                    screen[y * SCREENWIDTH + x] = color;
-                }
+            for pixel in screen.iter_mut().take(SCREENWIDTH * SCREENHEIGHT) {
+                *pixel = 0;
             }
         }
 
-        // 3. Travessia BSP para coletar segmentos de parede visiveis
+        // 3. Calcular basexscale/baseyscale (depende de viewangle, muda por frame)
+        let angle_idx = ((self.render_state.viewangle.0.wrapping_sub(Angle::ANG90.0))
+            >> ANGLETOFINESHIFT) as usize
+            & FINEMASK;
+        let basexscale =
+            (fine_cosine(angle_idx) / Fixed(self.render_state.centerxfrac.0)).0;
+        let baseyscale =
+            -(fine_sine(angle_idx) / Fixed(self.render_state.centerxfrac.0)).0;
+
+        // 4. Travessia BSP para coletar segmentos de parede visiveis
         let mut bsp = BspTraversal::new();
         if let Some(ref map) = self.map {
             bsp.render_bsp(map, &self.render_state);
         }
 
-        // 4. Renderizar paredes coletadas com perspectiva
-        let wall_segments: Vec<WallSegment> = bsp.wall_ranges.clone();
-        self.render_walls(&wall_segments);
+        // 5. Renderizar paredes coletadas com perspectiva e flats texturizados
+        // yslope e distscale sao tabelas constantes pre-calculadas na init
+        let plane_data = PlaneRenderData {
+            yslope: self.plane_yslope,
+            distscale: self.plane_distscale,
+            basexscale,
+            baseyscale,
+        };
+        let wall_segments = std::mem::take(&mut bsp.wall_ranges);
+        self.render_walls(&wall_segments, &plane_data);
+    }
+
+    /// Constroi cache de dados de flat (piso/teto) para o mapa atual.
+    ///
+    /// Carrega todos os flats referenciados pelos sectors do mapa
+    /// uma unica vez, armazenando em self.flat_cache.
+    /// Chamado ao carregar um novo mapa, nao a cada frame.
+    ///
+    /// C original: `R_InitFlats()` em `r_data.c`
+    fn build_flat_cache(&mut self) {
+        self.flat_cache.clear();
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+        let td = match &self.texture_data {
+            Some(td) => td,
+            None => return,
+        };
+
+        // Coletar nomes unicos de flats usados nos sectors
+        for sector in &map.sectors {
+            for flat_name in [&sector.floor_pic, &sector.ceiling_pic] {
+                if flat_name[0] == 0 || self.flat_cache.contains_key(flat_name) {
+                    continue;
+                }
+                // Encontrar o lump do flat
+                let end = flat_name.iter().position(|&b| b == 0).unwrap_or(8);
+                let name_str = std::str::from_utf8(&flat_name[..end]).unwrap_or("");
+                if let Some(flat_num) = td.flat_num_for_name(name_str, &self.wad) {
+                    let lump_idx = td.first_flat + flat_num;
+                    if let Ok(data) = self.wad.read_lump(lump_idx) {
+                        if data.len() >= 4096 {
+                            self.flat_cache.insert(*flat_name, data[..4096].to_vec());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inicializa as tabelas de projecao de planos (yslope e distscale).
+    ///
+    /// Estas tabelas sao constantes (dependem apenas das dimensoes da tela
+    /// e da tabela xtoviewangle, que nao muda). Calculadas uma unica vez
+    /// na inicializacao, evitando recalculo a cada frame.
+    ///
+    /// C original: parte de `R_InitTextureMapping()` e `R_SetupFrame()` em `r_main.c`
+    fn init_plane_tables(&mut self) {
+        // yslope[y] = FixedDiv(viewwidth/2, abs(y - centery))
+        for (i, slot) in self.plane_yslope.iter_mut().enumerate() {
+            let dy = ((i as i32 - SCREENHEIGHT as i32 / 2) << FRACBITS) + FRACUNIT / 2;
+            let dy = dy.abs();
+            if dy > 0 {
+                *slot = (Fixed::from_int(SCREENWIDTH as i32 / 2) / Fixed(dy)).0;
+            }
+        }
+
+        // distscale[x] = 1 / cos(xtoviewangle[x])
+        for (i, slot) in self.plane_distscale.iter_mut().enumerate() {
+            let cos_adj = fine_cosine(
+                (self.render_state.xtoviewangle[i].0 >> ANGLETOFINESHIFT) as usize & FINEMASK,
+            );
+            if cos_adj.0.abs() > 0 {
+                *slot = (Fixed(FRACUNIT) / cos_adj).0.abs();
+            }
+        }
     }
 
     /// Configura a camera do renderer a partir da posicao do jogador.
@@ -1144,14 +1279,18 @@ impl DoomEngine {
     ///
     /// Para cada segmento visivel:
     /// 1. Calcula a distancia perpendicular a parede
-    /// 2. Calcula a escala perspectiva coluna por coluna
-    /// 3. Desenha colunas de parede com cor baseada na luz do sector
-    /// 4. Preenche teto acima e piso abaixo da parede
-    /// 5. Atualiza arrays de clipping para oclusao correta
+    /// 2. Resolve texturas do sidedef (mid/top/bottom)
+    /// 3. Calcula rw_offset para mapeamento horizontal de textura
+    /// 4. Para cada coluna: calcula texturecolumn, dc_iscale, colormap
+    /// 5. Desenha colunas de parede com textura real via draw_column()
+    /// 6. Preenche teto acima e piso abaixo com cor plana
+    /// 7. Atualiza arrays de clipping para oclusao correta
     ///
     /// C original: `R_StoreWallRange()` + `R_RenderSegLoop()` em `r_segs.c`
     #[allow(clippy::too_many_lines)]
-    fn render_walls(&mut self, wall_segments: &[WallSegment]) {
+    fn render_walls(&mut self, wall_segments: &[WallSegment], planes: &PlaneRenderData) {
+        use crate::utils::tables::fine_tangent;
+
         let map = match &self.map {
             Some(m) => m,
             None => return,
@@ -1159,9 +1298,11 @@ impl DoomEngine {
 
         // Arrays de clipping: controlam quais regioes da tela ja foram
         // preenchidas por paredes mais proximas.
-        // C original: `floorclip[]`, `ceilingclip[]` em `r_plane.c`
         let mut floorclip = vec![SCREENHEIGHT as i16; SCREENWIDTH];
         let mut ceilingclip = vec![-1i16; SCREENWIDTH];
+
+        // Constante de LIGHTSCALESHIFT (C original: 12)
+        const LIGHTSCALESHIFT: usize = 12;
 
         for ws in wall_segments {
             if ws.seg_index >= map.segs.len() {
@@ -1175,8 +1316,7 @@ impl DoomEngine {
             let front_sector = &map.sectors[seg.front_sector];
             let is_solid = seg.back_sector.is_none();
 
-            // --- Calcular rw_distance (distancia perpendicular a parede) ---
-            // C original: R_StoreWallRange em r_segs.c, linhas ~400-410
+            // --- Calcular rw_distance ---
             let rw_normalangle = Angle(seg.angle.wrapping_add(Angle::ANG90.0));
 
             let offset_angle_raw = rw_normalangle.0.wrapping_sub(ws.angle1.0);
@@ -1197,23 +1337,20 @@ impl DoomEngine {
                 fine_sine((dist_angle.0 >> ANGLETOFINESHIFT) as usize & FINEMASK);
             let rw_distance = hyp * sineval;
 
-            // Proteger contra distancia zero
             if rw_distance.0 == 0 {
                 continue;
             }
 
-            // --- Calcular escala nas bordas do segmento ---
+            // --- Escala nas bordas do segmento ---
             let x1 = ws.x1.max(0);
             let x2 = ws.x2.min(SCREENWIDTH as i32 - 1);
             if x1 > x2 {
                 continue;
             }
 
-            let scale1 = self.scale_from_global_angle(
+            let rw_scale = self.scale_from_global_angle(
                 Angle(
-                    self.render_state
-                        .viewangle
-                        .0
+                    self.render_state.viewangle.0
                         .wrapping_add(self.render_state.xtoviewangle[x1 as usize].0),
                 ),
                 rw_normalangle,
@@ -1223,82 +1360,196 @@ impl DoomEngine {
             let scale2 = if x2 > x1 {
                 self.scale_from_global_angle(
                     Angle(
-                        self.render_state
-                            .viewangle
-                            .0
+                        self.render_state.viewangle.0
                             .wrapping_add(self.render_state.xtoviewangle[x2 as usize].0),
                     ),
                     rw_normalangle,
                     rw_distance,
                 )
             } else {
-                scale1
+                rw_scale
             };
 
             let rw_scalestep = if x2 > x1 {
-                (scale2 - scale1) / (x2 - x1)
+                (scale2 - rw_scale) / (x2 - x1)
             } else {
                 0
             };
 
-            // --- Alturas do mundo relativas a camera (HEIGHTBITS = 12) ---
-            let worldtop =
-                (front_sector.ceiling_height.0 - self.render_state.viewz.0) >> 4;
-            let worldbottom =
-                (front_sector.floor_height.0 - self.render_state.viewz.0) >> 4;
+            // --- Alturas do mundo (nao-shiftadas para comparacoes) ---
+            let worldtop_full = front_sector.ceiling_height.0 - self.render_state.viewz.0;
+            let worldbottom_full = front_sector.floor_height.0 - self.render_state.viewz.0;
 
-            // --- Alturas do back sector (para paredes two-sided) ---
-            let (worldhigh, worldlow) = if let Some(back_idx) = seg.back_sector {
+            let (worldhigh_full, worldlow_full) = if let Some(back_idx) = seg.back_sector {
                 if back_idx < map.sectors.len() {
                     let back = &map.sectors[back_idx];
                     (
-                        (back.ceiling_height.0 - self.render_state.viewz.0) >> 4,
-                        (back.floor_height.0 - self.render_state.viewz.0) >> 4,
+                        back.ceiling_height.0 - self.render_state.viewz.0,
+                        back.floor_height.0 - self.render_state.viewz.0,
                     )
                 } else {
-                    (worldtop, worldbottom)
+                    (worldtop_full, worldbottom_full)
                 }
             } else {
-                (worldtop, worldbottom)
+                (worldtop_full, worldbottom_full)
             };
 
-            let has_upper = !is_solid && worldhigh < worldtop;
-            let has_lower = !is_solid && worldlow > worldbottom;
+            let has_upper = !is_solid && worldhigh_full < worldtop_full;
+            let has_lower = !is_solid && worldlow_full > worldbottom_full;
 
-            // --- Cores baseadas no nivel de luz do sector ---
-            let light = (front_sector.light_level as usize).min(255);
-            let shade = (light / 16).min(15) as u8;
-            // Variacao horizontal/vertical para profundidade visual
+            // Shift para HEIGHTBITS (>> 4) apos comparacoes
+            let worldtop = worldtop_full >> 4;
+            let worldbottom = worldbottom_full >> 4;
+            let worldhigh = worldhigh_full >> 4;
+            let worldlow = worldlow_full >> 4;
+
+            // --- Resolver texturas do sidedef ---
+            let sidedef = if seg.sidedef < map.sidedefs.len() {
+                &map.sidedefs[seg.sidedef]
+            } else {
+                continue;
+            };
+            let linedef = if seg.linedef < map.linedefs.len() {
+                &map.linedefs[seg.linedef]
+            } else {
+                continue;
+            };
+
+            // Resolver nomes de textura para indices
+            let tex_data = self.texture_data.as_ref();
+            let mid_tex = tex_data.and_then(|td| {
+                Self::resolve_texture_name(&sidedef.mid_texture, td)
+            });
+            let top_tex = tex_data.and_then(|td| {
+                Self::resolve_texture_name(&sidedef.top_texture, td)
+            });
+            let bot_tex = tex_data.and_then(|td| {
+                Self::resolve_texture_name(&sidedef.bottom_texture, td)
+            });
+
+            let segtextured = mid_tex.is_some() || top_tex.is_some() || bot_tex.is_some();
+
+            // --- Calcular rw_offset (horizontal texture offset) ---
+            // C original: r_segs.c linhas 619-636
+            let (rw_offset, rw_centerangle) = if segtextured {
+                let mut oa = rw_normalangle.0.wrapping_sub(ws.angle1.0);
+                if oa > Angle::ANG180.0 {
+                    oa = 0u32.wrapping_sub(oa);
+                }
+                if oa > Angle::ANG90.0 {
+                    oa = Angle::ANG90.0;
+                }
+                let sineval2 = fine_sine((oa >> ANGLETOFINESHIFT) as usize & FINEMASK);
+                let mut offset = hyp * sineval2;
+
+                if rw_normalangle.0.wrapping_sub(ws.angle1.0) < Angle::ANG180.0 {
+                    offset = Fixed(0) - offset;
+                }
+                offset = offset + sidedef.texture_offset + seg.offset;
+
+                let center = Angle(
+                    Angle::ANG90.0.wrapping_add(
+                        self.render_state.viewangle.0.wrapping_sub(rw_normalangle.0),
+                    ),
+                );
+                (offset, center)
+            } else {
+                (Fixed(0), Angle::ANG0)
+            };
+
+            // --- Calcular dc_texturemid (vertical alignment com pegging) ---
+            let rw_midtexturemid = if is_solid {
+                if let Some(tex_idx) = mid_tex {
+                    if linedef.flags.contains(crate::map::types::LineDefFlags::DONT_PEG_BOTTOM) {
+                        // Bottom pegging: bottom of texture at floor
+                        let tex_h = tex_data.map_or(0, |td| td.texture_height[tex_idx].0);
+                        Fixed(front_sector.floor_height.0 + tex_h - self.render_state.viewz.0)
+                            + sidedef.row_offset
+                    } else {
+                        // Top pegging: top of texture at ceiling
+                        Fixed(worldtop_full) + sidedef.row_offset
+                    }
+                } else {
+                    Fixed(worldtop_full) + sidedef.row_offset
+                }
+            } else {
+                Fixed(0)
+            };
+
+            let rw_toptexturemid = if has_upper {
+                if let Some(tex_idx) = top_tex {
+                    if linedef.flags.contains(crate::map::types::LineDefFlags::DONT_PEG_TOP) {
+                        Fixed(worldtop_full) + sidedef.row_offset
+                    } else {
+                        // Bottom of texture at back ceiling
+                        let tex_h = tex_data.map_or(0, |td| td.texture_height[tex_idx].0);
+                        let back_ceil = if let Some(bi) = seg.back_sector {
+                            map.sectors[bi].ceiling_height.0
+                        } else {
+                            front_sector.ceiling_height.0
+                        };
+                        Fixed(back_ceil + tex_h - self.render_state.viewz.0)
+                            + sidedef.row_offset
+                    }
+                } else {
+                    Fixed(worldtop_full) + sidedef.row_offset
+                }
+            } else {
+                Fixed(0)
+            };
+
+            let rw_bottomtexturemid = if has_lower {
+                if linedef.flags.contains(crate::map::types::LineDefFlags::DONT_PEG_BOTTOM) {
+                    Fixed(worldtop_full) + sidedef.row_offset
+                } else {
+                    Fixed(worldlow_full) + sidedef.row_offset
+                }
+            } else {
+                Fixed(0)
+            };
+
+            // --- Nivel de luz do sector ---
+            let lightnum = ((front_sector.light_level as usize) >> 4).min(15);
+            // Variacao por orientacao da parede
             let v1y = map.vertexes[seg.v1].y.0;
             let v2y = map.vertexes[seg.v2].y.0;
             let v1x = map.vertexes[seg.v1].x.0;
             let v2x = map.vertexes[seg.v2].x.0;
-            let light_mod: i8 = if v1y == v2y {
-                -1 // paredes horizontais mais escuras
+            let lightnum = if v1y == v2y {
+                lightnum.saturating_sub(1) // paredes horizontais mais escuras
             } else if v1x == v2x {
-                1 // paredes verticais mais claras
+                (lightnum + 1).min(15) // paredes verticais mais claras
             } else {
-                0
+                lightnum
             };
-            let wall_shade = (shade as i8 + light_mod).clamp(0, 15) as u8;
-            let wall_color = 0x60 + wall_shade;
-            let ceil_color = shade / 4;
-            let floor_color = 0x80 + (shade / 2).min(7);
 
-            // --- Calcular fracs e steps para interpolacao (20.12 format) ---
+            let shade = lightnum as u8;
+            // Fallback colors se flat nao for encontrado
+            let ceil_color_fb = shade / 4;
+            let floor_color_fb = 0x80 + (shade / 2).min(7);
+
+            // Lookup flat data para piso e teto
+            let floor_flat = self.flat_cache.get(&front_sector.floor_pic);
+            let ceil_flat = self.flat_cache.get(&front_sector.ceiling_pic);
+
+            // Alturas absolutas do piso/teto (para planeheight)
+            let floor_h = front_sector.floor_height.0;
+            let ceil_h = front_sector.ceiling_height.0;
+            let viewz = self.render_state.viewz.0;
+
+            // --- Calcular fracs e steps (20.12 format) ---
             let centery4 = self.render_state.centeryfrac.0 >> 4;
             let mut topfrac =
-                centery4 - ((worldtop as i64 * scale1 as i64) >> FRACBITS) as i32;
+                centery4 - ((worldtop as i64 * rw_scale as i64) >> FRACBITS) as i32;
             let mut bottomfrac =
-                centery4 - ((worldbottom as i64 * scale1 as i64) >> FRACBITS) as i32;
+                centery4 - ((worldbottom as i64 * rw_scale as i64) >> FRACBITS) as i32;
             let topstep =
                 -((rw_scalestep as i64 * worldtop as i64) >> FRACBITS) as i32;
             let bottomstep =
                 -((rw_scalestep as i64 * worldbottom as i64) >> FRACBITS) as i32;
 
-            // Steps para upper/lower walls (two-sided)
             let mut pixhigh = if has_upper {
-                centery4 - ((worldhigh as i64 * scale1 as i64) >> FRACBITS) as i32
+                centery4 - ((worldhigh as i64 * rw_scale as i64) >> FRACBITS) as i32
             } else {
                 0
             };
@@ -1308,7 +1559,7 @@ impl DoomEngine {
                 0
             };
             let mut pixlow = if has_lower {
-                centery4 - ((worldlow as i64 * scale1 as i64) >> FRACBITS) as i32
+                centery4 - ((worldlow as i64 * rw_scale as i64) >> FRACBITS) as i32
             } else {
                 0
             };
@@ -1318,76 +1569,138 @@ impl DoomEngine {
                 0
             };
 
+            // Referencia aos colormaps para iluminacao de flats
+            let colormaps_ref = self.texture_data.as_ref().map(|td| td.colormaps.as_slice());
+
             // --- Renderizar colunas ---
             let screen = self.video.screen_mut(0);
             let sh = SCREENHEIGHT as i32;
+            let mut cur_scale = rw_scale;
 
             for x in x1..=x2 {
                 let xu = x as usize;
 
-                // Topo da parede (front sector ceiling)
+                // Topo e base da parede
                 let mut yl = (topfrac + 0xFFF) >> 12;
                 if yl < ceilingclip[xu] as i32 + 1 {
                     yl = ceilingclip[xu] as i32 + 1;
                 }
-
-                // Base da parede (front sector floor)
                 let mut yh = bottomfrac >> 12;
                 if yh >= floorclip[xu] as i32 {
                     yh = floorclip[xu] as i32 - 1;
                 }
 
+                // --- Calcular texturecolumn e colormap (se texturizado) ---
+                let (texturecolumn, colormap_offset) = if segtextured {
+                    // C original: r_segs.c linhas 265-274
+                    let angle = (rw_centerangle.0
+                        .wrapping_add(self.render_state.xtoviewangle[xu].0))
+                        >> ANGLETOFINESHIFT;
+                    let tangent = fine_tangent(angle as usize & FINEMASK);
+                    let tc = (rw_offset - rw_distance * tangent).0 >> FRACBITS;
+
+                    // Colormap baseada na escala (distancia)
+                    let light_idx = ((cur_scale as usize) >> LIGHTSCALESHIFT)
+                        .min(crate::renderer::state::MAXLIGHTSCALE - 1);
+                    let cm = self.render_state.scalelight[lightnum][light_idx];
+                    (tc, cm)
+                } else {
+                    (0, 0)
+                };
+
+                // dc_iscale = 0xFFFFFFFF / rw_scale
+                let dc_iscale = if cur_scale > 0 {
+                    Fixed((0xFFFF_FFFFu32 / cur_scale as u32) as i32)
+                } else {
+                    Fixed(0x7FFF_FFFF)
+                };
+
                 if is_solid {
                     // --- Parede solida (one-sided) ---
 
-                    // Teto: do topo do clipping ate o topo da parede
+                    // Teto com textura flat
                     let ct = (ceilingclip[xu] as i32 + 1).max(0);
                     let cb = (yl - 1).min(sh - 1);
-                    for y in ct..=cb {
-                        screen[y as usize * SCREENWIDTH + xu] = ceil_color;
+                    Self::draw_flat_column(
+                        screen, xu, ct, cb, ceil_flat, ceil_color_fb,
+                        (ceil_h - viewz).abs(), planes, &self.render_state,
+                        lightnum, colormaps_ref,
+                    );
+
+                    // Parede com textura
+                    if let Some(tex_idx) = mid_tex {
+                        if yl <= yh && yl >= 0 && yh < sh {
+                            if let Some(td) = &self.texture_data {
+                                let source = td.get_column(tex_idx, texturecolumn);
+                                if !source.is_empty() {
+                                    let colormap = &td.colormaps[colormap_offset..];
+                                    self.column_drawer.draw_column(
+                                        screen, xu, yl, yh, dc_iscale,
+                                        rw_midtexturemid, source, colormap,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let wt = yl.max(0);
+                        let wb = yh.min(sh - 1);
+                        for y in wt..=wb {
+                            screen[y as usize * SCREENWIDTH + xu] = 0x60 + shade;
+                        }
                     }
 
-                    // Parede
-                    let wt = yl.max(0);
-                    let wb = yh.min(sh - 1);
-                    for y in wt..=wb {
-                        screen[y as usize * SCREENWIDTH + xu] = wall_color;
-                    }
-
-                    // Piso: da base da parede ate o bottom do clipping
+                    // Piso com textura flat
                     let ft = (yh + 1).max(0);
                     let fb = (floorclip[xu] as i32 - 1).min(sh - 1);
-                    for y in ft..=fb {
-                        screen[y as usize * SCREENWIDTH + xu] = floor_color;
-                    }
+                    Self::draw_flat_column(
+                        screen, xu, ft, fb, floor_flat, floor_color_fb,
+                        (floor_h - viewz).abs(), planes, &self.render_state,
+                        lightnum, colormaps_ref,
+                    );
 
-                    // Marcar coluna como totalmente ocluida
                     ceilingclip[xu] = sh as i16;
                     floorclip[xu] = -1;
                 } else {
                     // --- Parede two-sided ---
 
-                    // Teto do front sector (markceiling)
-                    let mark_ceiling = worldhigh != worldtop || has_upper;
+                    // Teto com textura flat
+                    let mark_ceiling = worldhigh_full != worldtop_full || has_upper;
                     if mark_ceiling {
                         let ct = (ceilingclip[xu] as i32 + 1).max(0);
                         let cb = (yl - 1).min(sh - 1);
-                        for y in ct..=cb {
-                            screen[y as usize * SCREENWIDTH + xu] = ceil_color;
-                        }
+                        Self::draw_flat_column(
+                            screen, xu, ct, cb, ceil_flat, ceil_color_fb,
+                            (ceil_h - viewz).abs(), planes, &self.render_state,
+                            lightnum, colormaps_ref,
+                        );
                     }
 
-                    // Upper wall (se back ceiling < front ceiling)
+                    // Upper wall
                     if has_upper {
                         let mut mid = pixhigh >> 12;
                         if mid >= floorclip[xu] as i32 {
                             mid = floorclip[xu] as i32 - 1;
                         }
                         if mid >= yl {
-                            let wt = yl.max(0);
-                            let wb = mid.min(sh - 1);
-                            for y in wt..=wb {
-                                screen[y as usize * SCREENWIDTH + xu] = wall_color;
+                            if let Some(tex_idx) = top_tex {
+                                if yl >= 0 && mid < sh {
+                                    if let Some(td) = &self.texture_data {
+                                        let source = td.get_column(tex_idx, texturecolumn);
+                                        if !source.is_empty() {
+                                            let colormap = &td.colormaps[colormap_offset..];
+                                            self.column_drawer.draw_column(
+                                                screen, xu, yl, mid, dc_iscale,
+                                                rw_toptexturemid, source, colormap,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let wt = yl.max(0);
+                                let wb = mid.min(sh - 1);
+                                for y in wt..=wb {
+                                    screen[y as usize * SCREENWIDTH + xu] = 0x60 + shade;
+                                }
                             }
                             ceilingclip[xu] = mid as i16;
                         } else {
@@ -1397,17 +1710,32 @@ impl DoomEngine {
                         ceilingclip[xu] = (yl - 1) as i16;
                     }
 
-                    // Lower wall (se back floor > front floor)
+                    // Lower wall
                     if has_lower {
                         let mut mid = (pixlow + 0xFFF) >> 12;
                         if mid <= ceilingclip[xu] as i32 {
                             mid = ceilingclip[xu] as i32 + 1;
                         }
                         if mid <= yh {
-                            let wt = mid.max(0);
-                            let wb = yh.min(sh - 1);
-                            for y in wt..=wb {
-                                screen[y as usize * SCREENWIDTH + xu] = wall_color;
+                            if let Some(tex_idx) = bot_tex {
+                                if mid >= 0 && yh < sh {
+                                    if let Some(td) = &self.texture_data {
+                                        let source = td.get_column(tex_idx, texturecolumn);
+                                        if !source.is_empty() {
+                                            let colormap = &td.colormaps[colormap_offset..];
+                                            self.column_drawer.draw_column(
+                                                screen, xu, mid, yh, dc_iscale,
+                                                rw_bottomtexturemid, source, colormap,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let wt = mid.max(0);
+                                let wb = yh.min(sh - 1);
+                                for y in wt..=wb {
+                                    screen[y as usize * SCREENWIDTH + xu] = 0x60 + shade;
+                                }
                             }
                             floorclip[xu] = mid as i16;
                         } else {
@@ -1417,25 +1745,23 @@ impl DoomEngine {
                         floorclip[xu] = (yh + 1) as i16;
                     }
 
-                    // Piso do front sector (markfloor)
-                    let mark_floor = worldlow != worldbottom || has_lower;
+                    // Piso com textura flat
+                    let mark_floor = worldlow_full != worldbottom_full || has_lower;
                     if mark_floor {
                         let ft = (yh + 1).max(0);
                         let old_fc = floorclip[xu] as i32;
-                        // Piso vai do bottom da abertura ate o clip anterior
-                        // Usar o floorclip antes da atualizacao pelo lower wall
-                        let fb = old_fc.min(sh);
-                        for y in ft..fb {
-                            if y >= 0 && y < sh {
-                                screen[y as usize * SCREENWIDTH + xu] =
-                                    floor_color;
-                            }
-                        }
+                        let fb = old_fc.min(sh) - 1;
+                        Self::draw_flat_column(
+                            screen, xu, ft, fb, floor_flat, floor_color_fb,
+                            (floor_h - viewz).abs(), planes, &self.render_state,
+                            lightnum, colormaps_ref,
+                        );
                     }
                 }
 
                 topfrac += topstep;
                 bottomfrac += bottomstep;
+                cur_scale += rw_scalestep;
                 if has_upper {
                     pixhigh += pixhighstep;
                 }
@@ -1444,6 +1770,105 @@ impl DoomEngine {
                 }
             }
         }
+    }
+
+    /// Renderiza uma coluna vertical de flat (piso ou teto) com textura.
+    ///
+    /// Para cada pixel vertical na faixa [yt..yb], calcula a coordenada
+    /// de textura 64x64 usando projecao perspectiva (R_MapPlane simplificado).
+    /// Se o flat nao estiver no cache, usa cor de fallback.
+    ///
+    /// C original: `R_MapPlane()` em `r_plane.c`, adaptado de spans para colunas
+    #[allow(clippy::too_many_arguments)]
+    fn draw_flat_column(
+        screen: &mut [u8],
+        x: usize,
+        yt: i32,
+        yb: i32,
+        flat_data: Option<&Vec<u8>>,
+        fallback_color: u8,
+        planeheight: i32,
+        planes: &PlaneRenderData,
+        render_state: &RenderState,
+        lightnum: usize,
+        colormaps: Option<&[u8]>,
+    ) {
+        let sh = SCREENHEIGHT as i32;
+        if yt > yb || x >= SCREENWIDTH {
+            return;
+        }
+
+        let flat = match flat_data {
+            Some(data) if data.len() >= 4096 => data,
+            _ => {
+                // Sem flat: preencher com cor de fallback
+                for y in yt.max(0)..=yb.min(sh - 1) {
+                    screen[y as usize * SCREENWIDTH + x] = fallback_color;
+                }
+                return;
+            }
+        };
+
+        // Valores constantes para esta coluna (nao dependem de Y)
+        let planeheight_fixed = planeheight.abs() as i64;
+        let viewx = render_state.viewx.0;
+        let viewy = render_state.viewy.0;
+        let distscale_x = planes.distscale[x] as i64;
+
+        // Angulo e trig sao constantes para coluna x
+        let angle = render_state.viewangle.0.wrapping_add(render_state.xtoviewangle[x].0)
+            >> ANGLETOFINESHIFT;
+        let cos_val = fine_cosine(angle as usize & FINEMASK).0 as i64;
+        let sin_val = fine_sine(angle as usize & FINEMASK).0 as i64;
+        let neg_viewy = -viewy;
+
+        let y_start = yt.max(0);
+        let y_end = yb.min(sh - 1);
+
+        for y in y_start..=y_end {
+            let yu = y as usize;
+
+            // distance = planeheight * yslope[y] (FixedMul)
+            let distance = (planeheight_fixed * planes.yslope[yu] as i64) >> FRACBITS;
+
+            // length = distance * distscale[x] (FixedMul)
+            let length = (distance * distscale_x) >> FRACBITS;
+
+            // Posicao no mundo da textura
+            let xfrac = viewx.wrapping_add(((cos_val * length) >> FRACBITS) as i32);
+            let yfrac = neg_viewy.wrapping_sub(((sin_val * length) >> FRACBITS) as i32);
+
+            // Coordenadas na textura 64x64
+            let tx = ((xfrac >> FRACBITS) & 63) as usize;
+            let ty = ((yfrac >> FRACBITS) & 63) as usize;
+            let src_pixel = flat[ty * 64 + tx];
+
+            // Colormap baseada em distancia (zlight)
+            let pixel = if let Some(cm) = colormaps {
+                let z_idx = ((distance as usize) >> crate::renderer::state::LIGHTZSHIFT)
+                    .min(crate::renderer::state::MAXLIGHTZ - 1);
+                let cm_offset = render_state.zlight[lightnum][z_idx];
+                let idx = cm_offset + src_pixel as usize;
+                if idx < cm.len() { cm[idx] } else { src_pixel }
+            } else {
+                src_pixel
+            };
+
+            screen[yu * SCREENWIDTH + x] = pixel;
+        }
+    }
+
+    /// Resolve o nome de uma textura de sidedef para indice no TextureData.
+    ///
+    /// Retorna None se o nome for "-" (sem textura) ou nao encontrado.
+    fn resolve_texture_name(name: &[u8; 8], td: &TextureData) -> Option<usize> {
+        // "-" ou nome vazio = sem textura
+        if name[0] == b'-' || name[0] == 0 {
+            return None;
+        }
+        let end = name.iter().position(|&b| b == 0).unwrap_or(8);
+        let name_str = std::str::from_utf8(&name[..end]).unwrap_or("");
+        td.texture_num_for_name(name_str)
     }
 
     /// Retorna o framebuffer principal (screen 0) para blit.

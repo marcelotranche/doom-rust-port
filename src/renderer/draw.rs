@@ -204,10 +204,17 @@ impl ColumnDrawer {
         let fracstep = iscale.0;
         let mut frac = texturemid.0 + (yl - self.center_y) * fracstep;
 
+        // Mascara para wrap da textura: source.len() e potencia de 2
+        let tex_mask = if source.len().is_power_of_two() {
+            source.len() - 1
+        } else {
+            127
+        };
+
         let mut dest_offset = dest_start;
         for _ in 0..=count {
             // Buscar texel e aplicar iluminacao
-            let texel_index = ((frac >> FRACBITS) & 127) as usize;
+            let texel_index = ((frac >> FRACBITS) as usize) & tex_mask;
             let texel = source[texel_index];
             screen[dest_offset] = colormap[texel as usize];
 
