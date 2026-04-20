@@ -50,7 +50,7 @@ use crate::game::tick::TickSystem;
 use crate::game::ticker::{GameTicker, TickResult};
 use crate::game::thinker::ThinkerList;
 use crate::map::MapData;
-use crate::menu::navigation::MenuSystem;
+use crate::menu::navigation::{MenuAction, MenuSystem};
 use crate::renderer::state::RenderState;
 use crate::video::VideoSystem;
 use crate::wad::WadSystem;
@@ -298,6 +298,9 @@ impl DoomEngine {
         // D_ProcessEvents — despachar eventos para responders
         self.process_events();
 
+        // Processar acoes do menu (New Game, Episode, Skill, etc.)
+        self.process_menu_actions();
+
         // G_BuildTiccmd — converter input em ticcmd
         let consistancy = self.game.consistancy[self.game.consoleplayer]
             [self.game.maketic as usize % crate::game::state::BACKUPTICS];
@@ -352,8 +355,109 @@ impl DoomEngine {
                 continue;
             }
 
+            // No DemoScreen, qualquer tecla abre o menu principal
+            if is_down && self.game.state == GameStateType::DemoScreen && !self.menu.active {
+                self.menu.open();
+                continue;
+            }
+
             // Game responder (atualiza estado de teclas)
             self.input.handle_event(&ev);
+        }
+    }
+
+    /// Processa acoes pendentes do sistema de menus.
+    ///
+    /// Quando o jogador seleciona um item no menu, o MenuSystem grava
+    /// a acao em `last_action`. O engine consome e executa:
+    /// - SubMenu: navega para o submenu apropriado
+    /// - ChooseEpisode: seleciona o episodio e abre menu de skill
+    /// - ChooseSkill: inicia o jogo com o episodio e skill selecionados
+    /// - QuitGame: encerra o engine
+    ///
+    /// C original: callbacks em `menuitem_t` em `m_menu.c`
+    fn process_menu_actions(&mut self) {
+        let action = match self.menu.take_action() {
+            Some(a) => a,
+            None => return,
+        };
+
+        match action {
+            MenuAction::SubMenu => {
+                // Mapear item do main menu para submenu
+                let submenu = match self.menu.current_menu {
+                    0 => match self.menu.item_on {
+                        0 => Some(1), // New Game → Episode menu
+                        1 => Some(3), // Options → Options menu
+                        2 => Some(4), // Load Game → Load menu
+                        3 => Some(5), // Save Game → Save menu
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                if let Some(menu_idx) = submenu {
+                    self.menu.current_menu = menu_idx;
+                    self.menu.item_on = self.menu.menus[menu_idx].last_on;
+                }
+            }
+
+            MenuAction::ChooseEpisode => {
+                // Selecionar episodio e abrir menu de skill
+                self.game.episode = self.menu.item_on as i32 + 1;
+                self.menu.current_menu = 2; // Skill menu
+                self.menu.item_on = self.menu.menus[2].last_on;
+            }
+
+            MenuAction::ChooseSkill => {
+                // Iniciar novo jogo com episodio e skill selecionados
+                let skill = match self.menu.item_on {
+                    0 => Skill::Baby,
+                    1 => Skill::Easy,
+                    2 => Skill::Medium,
+                    3 => Skill::Hard,
+                    4 => Skill::Nightmare,
+                    _ => Skill::Medium,
+                };
+
+                self.menu.close();
+                self.game.skill = skill;
+                self.game.map = 1;
+                self.game.action = GameAction::LoadLevel;
+                self.game.state = GameStateType::Level;
+
+                // Carregar o mapa
+                let map_name = format!("E{}M{}", self.game.episode, self.game.map);
+                match MapData::load(&map_name, &self.wad) {
+                    Ok(mut map) => {
+                        map.finalize();
+                        log::info!("P_SetupLevel: {} carregado", map_name);
+                        self.map = Some(map);
+                        self.game.action = GameAction::Nothing;
+                        self.game.viewactive = true;
+                        self.game.levelstarttic = self.game.gametic;
+                    }
+                    Err(e) => {
+                        log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
+                        self.game.state = GameStateType::DemoScreen;
+                        self.game.action = GameAction::Nothing;
+                    }
+                }
+            }
+
+            MenuAction::QuitGame => {
+                self.running = false;
+            }
+
+            MenuAction::NewGame => {
+                // Abrir episodio menu diretamente
+                self.menu.current_menu = 1;
+                self.menu.item_on = 0;
+            }
+
+            _ => {
+                // Outras acoes (Options, Volume, etc.) — TODO
+            }
         }
     }
 
@@ -780,6 +884,8 @@ mod tests {
     fn engine_process_events_key() {
         use crate::game::events::{Event, KEY_UPARROW};
         let mut engine = DoomEngine::new();
+        // Colocar em Level para que a tecla nao abra o menu
+        engine.game.state = GameStateType::Level;
         engine.event_queue.post(Event::key_down(KEY_UPARROW));
         engine.process_events();
         assert!(engine.input.gamekeydown[KEY_UPARROW as usize]);
