@@ -566,6 +566,84 @@ impl DoomEngine {
                 }
             }
         }
+
+        // Menu overlay — desenha por cima de tudo quando ativo
+        if self.menu.active {
+            self.draw_menu();
+        }
+    }
+
+    /// Desenha o menu ativo sobre o framebuffer.
+    ///
+    /// Carrega patches do WAD para cada item de menu e desenha
+    /// na posicao definida pelo menu. Um indicador (seta) marca
+    /// o item selecionado.
+    ///
+    /// C original: `M_Drawer()` em `m_menu.c`
+    fn draw_menu(&mut self) {
+        let menu_idx = self.menu.current_menu;
+        let menu_x = self.menu.menus[menu_idx].x;
+        let menu_y = self.menu.menus[menu_idx].y;
+        let item_on = self.menu.item_on;
+        let items: Vec<_> = self.menu.menus[menu_idx]
+            .items
+            .iter()
+            .map(|item| item.name.to_string())
+            .collect();
+
+        let line_height = crate::menu::navigation::LINEHEIGHT;
+
+        for (i, lump_name) in items.iter().enumerate() {
+            let y = menu_y + (i as i32) * line_height;
+
+            if !lump_name.is_empty() {
+                if let Ok(data) = self.wad.read_lump_by_name(lump_name) {
+                    if data.len() > 8 {
+                        self.video.draw_patch(menu_x, y, 0, &data);
+                    }
+                }
+            }
+
+            // Desenhar indicador de selecao (seta ">>" em pixels)
+            if i == item_on {
+                self.draw_selector(menu_x - 20, y);
+            }
+        }
+    }
+
+    /// Desenha um indicador de selecao (cursor) ao lado do item de menu.
+    ///
+    /// No DOOM original, seria o skull cursor animado (M_SKULL1/M_SKULL2).
+    /// Aqui tentamos carregar o skull do WAD; se nao encontrar,
+    /// desenhamos um marcador simples.
+    fn draw_selector(&mut self, x: i32, y: i32) {
+        // Tentar carregar skull cursor do WAD
+        let skull_name = if self.menu.skull_frame == 0 {
+            "M_SKULL1"
+        } else {
+            "M_SKULL2"
+        };
+
+        if let Ok(data) = self.wad.read_lump_by_name(skull_name) {
+            if data.len() > 8 {
+                self.video.draw_patch(x, y, 0, &data);
+                return;
+            }
+        }
+
+        // Fallback: retangulo branco como indicador
+        let w = crate::video::SCREENWIDTH;
+        let h = crate::video::SCREENHEIGHT;
+        let screen = self.video.screen_mut(0);
+        for dy in 0..10 {
+            for dx in 0..10 {
+                let px = x + dx;
+                let py = y + dy + 3;
+                if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                    screen[py as usize * w + px as usize] = 0x04; // vermelho DOOM
+                }
+            }
+        }
     }
 
     /// Desenha a tela de titulo (TITLEPIC) do WAD.
