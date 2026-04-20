@@ -471,11 +471,25 @@ impl DoomEngine {
     ///
     /// C original: `D_PageDrawer()` em `d_main.c`
     fn draw_title_screen(&mut self) {
-        // Tentar carregar TITLEPIC como raw 320x200
-        if let Ok(data) = self.wad.read_lump_by_name("TITLEPIC") {
-            let screen = self.video.screen_mut(0);
-            let copy_len = data.len().min(screen.len());
-            screen[..copy_len].copy_from_slice(&data[..copy_len]);
+        // Nomes dos lumps de tela por pagina do demo screen
+        let page_names = ["TITLEPIC", "CREDIT", "HELP1"];
+        let page = (self.ticker.demo_page as usize) % page_names.len();
+        let lump_name = page_names[page];
+
+        if let Ok(data) = self.wad.read_lump_by_name(lump_name) {
+            if data.len() == crate::video::SCREEN_SIZE {
+                // Lump raw 320x200 (alguns WADs armazenam assim)
+                let screen = self.video.screen_mut(0);
+                screen.copy_from_slice(&data);
+            } else if data.len() > 8 {
+                // Lump em formato patch (column-based) — formato padrao
+                // Limpar tela antes de desenhar o patch
+                let screen = self.video.screen_mut(0);
+                for pixel in screen.iter_mut() {
+                    *pixel = 0;
+                }
+                self.video.draw_patch(0, 0, 0, &data);
+            }
             return;
         }
 
