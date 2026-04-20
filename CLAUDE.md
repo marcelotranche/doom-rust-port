@@ -82,6 +82,7 @@ branches de feature/fase criadas a partir dela.
 - [x] Fase 8: Menus e HUD
 - [x] Fase 9: Networking
 - [x] Fase 10: Polish e freedoom jogavel
+- [ ] Fase 11: Integracao SDL2 — janela, rendering e input
 
 ## Compact Instructions
 Ao compactar a conversa, preservar:

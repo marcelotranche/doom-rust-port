@@ -50,7 +50,7 @@ use crate::game::tick::TickSystem;
 use crate::game::ticker::{GameTicker, TickResult};
 use crate::game::thinker::ThinkerList;
 use crate::map::MapData;
-use crate::menu::navigation::MenuSystem;
+use crate::menu::navigation::{MenuAction, MenuSystem};
 use crate::renderer::state::RenderState;
 use crate::video::VideoSystem;
 use crate::wad::WadSystem;
@@ -95,6 +95,15 @@ pub struct DoomEngine {
     /// Estado do efeito wipe
     pub wipe: WipeState,
 
+    // -- Posicao do jogador (para automap) --
+
+    /// Posicao X do jogador no mapa (inteiro, unidades de mapa)
+    pub player_x: i32,
+    /// Posicao Y do jogador no mapa
+    pub player_y: i32,
+    /// Angulo do jogador em graus (0-359)
+    pub player_angle: i32,
+
     // -- Flags de controle --
 
     /// Modo desenvolvedor ativo
@@ -130,6 +139,9 @@ impl DoomEngine {
             map: None,
             display_config: DisplayConfig::default(),
             wipe: WipeState::new(),
+            player_x: 0,
+            player_y: 0,
+            player_angle: 90,
             devparm: false,
             nomonsters: false,
             fastparm: false,
@@ -266,6 +278,7 @@ impl DoomEngine {
                     engine.game.action = GameAction::Nothing;
                     engine.game.viewactive = true;
                     engine.game.levelstarttic = 0;
+                    engine.init_player_position();
                 }
                 Err(e) => {
                     log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
@@ -298,6 +311,9 @@ impl DoomEngine {
         // D_ProcessEvents — despachar eventos para responders
         self.process_events();
 
+        // Processar acoes do menu (New Game, Episode, Skill, etc.)
+        self.process_menu_actions();
+
         // G_BuildTiccmd — converter input em ticcmd
         let consistancy = self.game.consistancy[self.game.consoleplayer]
             [self.game.maketic as usize % crate::game::state::BACKUPTICS];
@@ -322,11 +338,16 @@ impl DoomEngine {
             }
         }
 
+        // Aplicar movimento do jogador (para automap interativo)
+        if self.game.state == GameStateType::Level {
+            self.apply_player_movement();
+        }
+
         // Atualizar display config com base no estado
         self.update_display_config();
 
         // D_Display — renderizar frame
-        // (na versao completa, chamaria R_RenderPlayerView, drawers, etc.)
+        self.d_display();
 
         // Atualizar wipe
         if self.wipe.is_active() {
@@ -352,8 +373,110 @@ impl DoomEngine {
                 continue;
             }
 
+            // No DemoScreen, qualquer tecla abre o menu principal
+            if is_down && self.game.state == GameStateType::DemoScreen && !self.menu.active {
+                self.menu.open();
+                continue;
+            }
+
             // Game responder (atualiza estado de teclas)
             self.input.handle_event(&ev);
+        }
+    }
+
+    /// Processa acoes pendentes do sistema de menus.
+    ///
+    /// Quando o jogador seleciona um item no menu, o MenuSystem grava
+    /// a acao em `last_action`. O engine consome e executa:
+    /// - SubMenu: navega para o submenu apropriado
+    /// - ChooseEpisode: seleciona o episodio e abre menu de skill
+    /// - ChooseSkill: inicia o jogo com o episodio e skill selecionados
+    /// - QuitGame: encerra o engine
+    ///
+    /// C original: callbacks em `menuitem_t` em `m_menu.c`
+    fn process_menu_actions(&mut self) {
+        let action = match self.menu.take_action() {
+            Some(a) => a,
+            None => return,
+        };
+
+        match action {
+            MenuAction::SubMenu => {
+                // Mapear item do main menu para submenu
+                let submenu = match self.menu.current_menu {
+                    0 => match self.menu.item_on {
+                        0 => Some(1), // New Game → Episode menu
+                        1 => Some(3), // Options → Options menu
+                        2 => Some(4), // Load Game → Load menu
+                        3 => Some(5), // Save Game → Save menu
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                if let Some(menu_idx) = submenu {
+                    self.menu.current_menu = menu_idx;
+                    self.menu.item_on = self.menu.menus[menu_idx].last_on;
+                }
+            }
+
+            MenuAction::ChooseEpisode => {
+                // Selecionar episodio e abrir menu de skill
+                self.game.episode = self.menu.item_on as i32 + 1;
+                self.menu.current_menu = 2; // Skill menu
+                self.menu.item_on = self.menu.menus[2].last_on;
+            }
+
+            MenuAction::ChooseSkill => {
+                // Iniciar novo jogo com episodio e skill selecionados
+                let skill = match self.menu.item_on {
+                    0 => Skill::Baby,
+                    1 => Skill::Easy,
+                    2 => Skill::Medium,
+                    3 => Skill::Hard,
+                    4 => Skill::Nightmare,
+                    _ => Skill::Medium,
+                };
+
+                self.menu.close();
+                self.game.skill = skill;
+                self.game.map = 1;
+                self.game.action = GameAction::LoadLevel;
+                self.game.state = GameStateType::Level;
+
+                // Carregar o mapa
+                let map_name = format!("E{}M{}", self.game.episode, self.game.map);
+                match MapData::load(&map_name, &self.wad) {
+                    Ok(mut map) => {
+                        map.finalize();
+                        log::info!("P_SetupLevel: {} carregado", map_name);
+                        self.map = Some(map);
+                        self.game.action = GameAction::Nothing;
+                        self.game.viewactive = true;
+                        self.game.levelstarttic = self.game.gametic;
+                        self.init_player_position();
+                    }
+                    Err(e) => {
+                        log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
+                        self.game.state = GameStateType::DemoScreen;
+                        self.game.action = GameAction::Nothing;
+                    }
+                }
+            }
+
+            MenuAction::QuitGame => {
+                self.running = false;
+            }
+
+            MenuAction::NewGame => {
+                // Abrir episodio menu diretamente
+                self.menu.current_menu = 1;
+                self.menu.item_on = 0;
+            }
+
+            _ => {
+                // Outras acoes (Options, Volume, etc.) — TODO
+            }
         }
     }
 
@@ -402,6 +525,7 @@ impl DoomEngine {
         // Limpar estado anterior
         self.thinkers.clear();
         self.map = Some(map);
+        self.init_player_position();
 
         // Resetar contadores
         self.game.levelstarttic = self.game.gametic;
@@ -414,6 +538,52 @@ impl DoomEngine {
         self.wipe.start(crate::video::SCREENWIDTH);
 
         Ok(())
+    }
+
+    /// Inicializa a posicao do jogador a partir do Player 1 start
+    /// thing do mapa carregado.
+    ///
+    /// C original: thing_type 1 = Player 1 start em `p_mobj.c`
+    fn init_player_position(&mut self) {
+        if let Some(ref map) = self.map {
+            // Thing type 1 = Player 1 start
+            if let Some(start) = map.things.iter().find(|t| t.thing_type == 1) {
+                self.player_x = start.x.to_int();
+                self.player_y = start.y.to_int();
+                self.player_angle = start.angle as i32;
+            }
+        }
+    }
+
+    /// Aplica o ticcmd atual para mover o jogador no automap.
+    ///
+    /// Converte forwardmove/angleturn do ticcmd em deslocamento
+    /// na posicao do jogador usando seno/cosseno do angulo.
+    fn apply_player_movement(&mut self) {
+        let slot = (self.game.gametic as usize).wrapping_sub(1) % crate::game::state::BACKUPTICS;
+        let cmd = self.game.localcmds[slot];
+
+        // Rotacao
+        self.player_angle = (self.player_angle + cmd.angleturn as i32 / 16) % 360;
+        if self.player_angle < 0 {
+            self.player_angle += 360;
+        }
+
+        // Movimento frente/tras
+        if cmd.forwardmove != 0 {
+            let angle_rad = (self.player_angle as f64) * std::f64::consts::PI / 180.0;
+            let speed = cmd.forwardmove as f64 * 2.0;
+            self.player_x += (speed * angle_rad.cos()) as i32;
+            self.player_y += (speed * angle_rad.sin()) as i32;
+        }
+
+        // Strafe esquerda/direita
+        if cmd.sidemove != 0 {
+            let angle_rad = ((self.player_angle - 90) as f64) * std::f64::consts::PI / 180.0;
+            let speed = cmd.sidemove as f64 * 2.0;
+            self.player_x += (speed * angle_rad.cos()) as i32;
+            self.player_y += (speed * angle_rad.sin()) as i32;
+        }
     }
 
     /// Retorna o numero de ticks por segundo.
@@ -431,11 +601,345 @@ impl DoomEngine {
         self.game.state
     }
 
+    /// Renderiza o frame atual no framebuffer.
+    ///
+    /// Seleciona o drawer apropriado conforme o estado do jogo:
+    /// - Level: automap top-down do mapa carregado
+    /// - DemoScreen: TITLEPIC do WAD ou padrao de teste
+    /// - Intermission/Finale: padrao com cor de fundo
+    ///
+    /// C original: `D_Display()` em `d_main.c`
+    fn d_display(&mut self) {
+        match self.game.state {
+            GameStateType::Level => {
+                self.draw_automap();
+            }
+            GameStateType::DemoScreen => {
+                self.draw_title_screen();
+            }
+            GameStateType::Intermission => {
+                // Tela de intermissao — cor de fundo azul escuro
+                let screen = self.video.screen_mut(0);
+                for pixel in screen.iter_mut() {
+                    *pixel = 0xC7; // azul escuro na paleta DOOM
+                }
+            }
+            GameStateType::Finale => {
+                // Tela de finale — cor de fundo preto
+                let screen = self.video.screen_mut(0);
+                for pixel in screen.iter_mut() {
+                    *pixel = 0;
+                }
+            }
+        }
+
+        // Menu overlay — desenha por cima de tudo quando ativo
+        if self.menu.active {
+            self.draw_menu();
+        }
+    }
+
+    /// Desenha o menu ativo sobre o framebuffer.
+    ///
+    /// Carrega patches do WAD para cada item de menu e desenha
+    /// na posicao definida pelo menu. Um indicador (seta) marca
+    /// o item selecionado.
+    ///
+    /// C original: `M_Drawer()` em `m_menu.c`
+    fn draw_menu(&mut self) {
+        let menu_idx = self.menu.current_menu;
+        let menu_x = self.menu.menus[menu_idx].x;
+        let menu_y = self.menu.menus[menu_idx].y;
+        let item_on = self.menu.item_on;
+        let items: Vec<_> = self.menu.menus[menu_idx]
+            .items
+            .iter()
+            .map(|item| item.name.to_string())
+            .collect();
+
+        let line_height = crate::menu::navigation::LINEHEIGHT;
+
+        for (i, lump_name) in items.iter().enumerate() {
+            let y = menu_y + (i as i32) * line_height;
+
+            if !lump_name.is_empty() {
+                if let Ok(data) = self.wad.read_lump_by_name(lump_name) {
+                    if data.len() > 8 {
+                        self.video.draw_patch(menu_x, y, 0, &data);
+                    }
+                }
+            }
+
+            // Desenhar indicador de selecao (seta ">>" em pixels)
+            if i == item_on {
+                self.draw_selector(menu_x - 20, y);
+            }
+        }
+    }
+
+    /// Desenha um indicador de selecao (cursor) ao lado do item de menu.
+    ///
+    /// No DOOM original, seria o skull cursor animado (M_SKULL1/M_SKULL2).
+    /// Aqui tentamos carregar o skull do WAD; se nao encontrar,
+    /// desenhamos um marcador simples.
+    fn draw_selector(&mut self, x: i32, y: i32) {
+        // Tentar carregar skull cursor do WAD
+        let skull_name = if self.menu.skull_frame == 0 {
+            "M_SKULL1"
+        } else {
+            "M_SKULL2"
+        };
+
+        if let Ok(data) = self.wad.read_lump_by_name(skull_name) {
+            if data.len() > 8 {
+                self.video.draw_patch(x, y, 0, &data);
+                return;
+            }
+        }
+
+        // Fallback: retangulo branco como indicador
+        let w = crate::video::SCREENWIDTH;
+        let h = crate::video::SCREENHEIGHT;
+        let screen = self.video.screen_mut(0);
+        for dy in 0..10 {
+            for dx in 0..10 {
+                let px = x + dx;
+                let py = y + dy + 3;
+                if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                    screen[py as usize * w + px as usize] = 0x04; // vermelho DOOM
+                }
+            }
+        }
+    }
+
+    /// Desenha a tela de titulo (TITLEPIC) do WAD.
+    ///
+    /// Tenta carregar o lump TITLEPIC como um flat raw de 320x200.
+    /// Se nao encontrar, desenha um padrao de teste colorido.
+    ///
+    /// C original: `D_PageDrawer()` em `d_main.c`
+    fn draw_title_screen(&mut self) {
+        // Nomes dos lumps de tela por pagina do demo screen
+        let page_names = ["TITLEPIC", "CREDIT", "HELP1"];
+        let page = (self.ticker.demo_page as usize) % page_names.len();
+        let lump_name = page_names[page];
+
+        if let Ok(data) = self.wad.read_lump_by_name(lump_name) {
+            if data.len() == crate::video::SCREEN_SIZE {
+                // Lump raw 320x200 (alguns WADs armazenam assim)
+                let screen = self.video.screen_mut(0);
+                screen.copy_from_slice(&data);
+            } else if data.len() > 8 {
+                // Lump em formato patch (column-based) — formato padrao
+                // Limpar tela antes de desenhar o patch
+                let screen = self.video.screen_mut(0);
+                for pixel in screen.iter_mut() {
+                    *pixel = 0;
+                }
+                self.video.draw_patch(0, 0, 0, &data);
+            }
+            return;
+        }
+
+        // Fallback: padrao de teste para verificar que o pipeline funciona
+        self.draw_test_pattern();
+    }
+
+    /// Desenha um padrao de teste colorido no framebuffer.
+    ///
+    /// Barras verticais usando diferentes indices da paleta DOOM.
+    /// Util para verificar que o pipeline video esta funcionando.
+    fn draw_test_pattern(&mut self) {
+        let screen = self.video.screen_mut(0);
+        let w = crate::video::SCREENWIDTH;
+        let h = crate::video::SCREENHEIGHT;
+
+        for y in 0..h {
+            for x in 0..w {
+                // Barras verticais coloridas (16 barras de 20px)
+                let bar = x / 20;
+                // Usar diferentes rampas de cor da paleta DOOM
+                let brightness = (y * 16 / h) as u8;
+                let color = (bar as u8 * 16).wrapping_add(brightness);
+                screen[y * w + x] = color;
+            }
+        }
+    }
+
+    /// Desenha uma vista automap (top-down) do mapa carregado.
+    ///
+    /// Renderiza as linedefs do mapa como linhas coloridas no
+    /// framebuffer, similar ao automap do DOOM (tecla TAB).
+    /// Paredes one-sided em vermelho, two-sided em cinza/marrom.
+    ///
+    /// C original: `AM_Drawer()` em `am_map.c`
+    fn draw_automap(&mut self) {
+        let w = crate::video::SCREENWIDTH;
+        let h = crate::video::SCREENHEIGHT;
+
+        // Limpar tela com cor de fundo escura
+        let screen = self.video.screen_mut(0);
+        for pixel in screen.iter_mut() {
+            *pixel = 0; // preto
+        }
+
+        // Precisamos do mapa para desenhar
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+
+        if map.vertexes.is_empty() || map.linedefs.is_empty() {
+            return;
+        }
+
+        // Calcular bounding box do mapa (em coordenadas inteiras)
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+
+        for v in &map.vertexes {
+            let ix = v.x.to_int();
+            let iy = v.y.to_int();
+            min_x = min_x.min(ix);
+            max_x = max_x.max(ix);
+            min_y = min_y.min(iy);
+            max_y = max_y.max(iy);
+        }
+
+        let map_width = max_x - min_x;
+        let map_height = max_y - min_y;
+
+        if map_width <= 0 || map_height <= 0 {
+            return;
+        }
+
+        // Escala fixa: ~1 pixel por unidade de mapa, centrado no jogador
+        // Zoom que mostra area de ~300 unidades de mapa na tela
+        let scale: i64 = ((w as i64) << 16) / (map_width as i64).max(1);
+        let scale_y_val: i64 = ((h as i64) << 16) / (map_height as i64).max(1);
+        let scale = scale.min(scale_y_val);
+
+        // Centralizar no jogador
+        let center_x = w as i32 / 2;
+        let center_y = h as i32 / 2;
+        let px = self.player_x;
+        let py = self.player_y;
+
+        // Converter coordenada do mapa para pixel na tela
+        let to_screen = |mx: i32, my: i32| -> (i32, i32) {
+            let sx = center_x + (((mx - px) as i64 * scale) >> 16) as i32;
+            // Y invertido: no DOOM y cresce para cima, na tela para baixo
+            let sy = center_y - (((my - py) as i64 * scale) >> 16) as i32;
+            (sx, sy)
+        };
+
+        // Desenhar cada linedef como uma linha
+        // Copiar dados necessarios para evitar borrow conflict
+        let lines: Vec<_> = map.linedefs.iter().map(|ld| {
+            let v1 = map.vertexes[ld.v1];
+            let v2 = map.vertexes[ld.v2];
+            let two_sided = ld.flags.contains(crate::map::types::LineDefFlags::TWO_SIDED);
+            (v1.x.to_int(), v1.y.to_int(), v2.x.to_int(), v2.y.to_int(), two_sided)
+        }).collect();
+
+        // Posicao do jogador na tela (sempre no centro)
+        let player_screen = to_screen(px, py);
+        let player_angle = self.player_angle;
+
+        let screen = self.video.screen_mut(0);
+
+        for &(v1x, v1y, v2x, v2y, two_sided) in &lines {
+            let (x1, y1) = to_screen(v1x, v1y);
+            let (x2, y2) = to_screen(v2x, v2y);
+
+            // Cor: vermelho para one-sided, cinza/marrom para two-sided
+            let color: u8 = if two_sided { 0x60 } else { 0xAC };
+
+            // Bresenham line drawing
+            draw_line(screen, w, h, x1, y1, x2, y2, color);
+        }
+
+        // Desenhar seta do jogador (triangulo apontando na direcao do angulo)
+        let angle_rad = (player_angle as f64) * std::f64::consts::PI / 180.0;
+        let arrow_len: f64 = 8.0;
+        let (psx, psy) = player_screen;
+
+        // Ponta da seta
+        let tip_x = psx + (arrow_len * angle_rad.cos()) as i32;
+        let tip_y = psy - (arrow_len * angle_rad.sin()) as i32;
+
+        // Dois cantos traseiros da seta
+        let back_angle1 = angle_rad + 2.5;
+        let back_angle2 = angle_rad - 2.5;
+        let back_len: f64 = 5.0;
+        let b1x = psx + (back_len * back_angle1.cos()) as i32;
+        let b1y = psy - (back_len * back_angle1.sin()) as i32;
+        let b2x = psx + (back_len * back_angle2.cos()) as i32;
+        let b2y = psy - (back_len * back_angle2.sin()) as i32;
+
+        // Cor branca (0x04 = branco brilhante na paleta DOOM)
+        draw_line(screen, w, h, tip_x, tip_y, b1x, b1y, 0x04);
+        draw_line(screen, w, h, tip_x, tip_y, b2x, b2y, 0x04);
+        draw_line(screen, w, h, b1x, b1y, b2x, b2y, 0x04);
+    }
+
+    /// Retorna o framebuffer principal (screen 0) para blit.
+    pub fn framebuffer(&self) -> &[u8] {
+        self.video.screen(0)
+    }
+
     /// Encerra o engine.
     pub fn quit(&mut self) {
         log::info!("D_QuitNetGame: Encerrando rede...");
         log::info!("I_Quit: Encerrando engine.");
         self.running = false;
+    }
+}
+
+/// Desenha uma linha no framebuffer usando algoritmo de Bresenham.
+///
+/// Clippa coordenadas contra os limites da tela antes de desenhar.
+#[allow(clippy::too_many_arguments)]
+fn draw_line(
+    screen: &mut [u8],
+    screen_w: usize,
+    screen_h: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: u8,
+) {
+    let mut x0 = x0;
+    let mut y0 = y0;
+
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx: i32 = if x0 < x1 { 1 } else { -1 };
+    let sy: i32 = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        // Desenhar pixel se dentro da tela
+        if x0 >= 0 && x0 < screen_w as i32 && y0 >= 0 && y0 < screen_h as i32 {
+            screen[y0 as usize * screen_w + x0 as usize] = color;
+        }
+
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
     }
 }
 
@@ -547,6 +1051,8 @@ mod tests {
     fn engine_process_events_key() {
         use crate::game::events::{Event, KEY_UPARROW};
         let mut engine = DoomEngine::new();
+        // Colocar em Level para que a tecla nao abra o menu
+        engine.game.state = GameStateType::Level;
         engine.event_queue.post(Event::key_down(KEY_UPARROW));
         engine.process_events();
         assert!(engine.input.gamekeydown[KEY_UPARROW as usize]);
