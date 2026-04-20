@@ -555,35 +555,131 @@ impl DoomEngine {
         }
     }
 
-    /// Aplica o ticcmd atual para mover o jogador no automap.
+    /// Aplica o ticcmd atual para mover o jogador.
     ///
     /// Converte forwardmove/angleturn do ticcmd em deslocamento
-    /// na posicao do jogador usando seno/cosseno do angulo.
+    /// e verifica colisao com linedefs one-sided (paredes solidas)
+    /// antes de aplicar o movimento.
+    ///
+    /// C original: `P_MovePlayer()` em `p_user.c` +
+    ///             `P_XYMovement()` / `P_TryMove()` em `p_map.c`
     fn apply_player_movement(&mut self) {
         let slot = (self.game.gametic as usize).wrapping_sub(1) % crate::game::state::BACKUPTICS;
         let cmd = self.game.localcmds[slot];
 
-        // Rotacao
+        // Rotacao (P_MovePlayer: mo->angle += cmd->angleturn<<16)
         self.player_angle = (self.player_angle + cmd.angleturn as i32 / 16) % 360;
         if self.player_angle < 0 {
             self.player_angle += 360;
         }
 
-        // Movimento frente/tras
+        // Calcular deslocamento desejado
+        let mut dx: f64 = 0.0;
+        let mut dy: f64 = 0.0;
+
         if cmd.forwardmove != 0 {
             let angle_rad = (self.player_angle as f64) * std::f64::consts::PI / 180.0;
             let speed = cmd.forwardmove as f64 * 2.0;
-            self.player_x += (speed * angle_rad.cos()) as i32;
-            self.player_y += (speed * angle_rad.sin()) as i32;
+            dx += speed * angle_rad.cos();
+            dy += speed * angle_rad.sin();
         }
 
-        // Strafe esquerda/direita
         if cmd.sidemove != 0 {
             let angle_rad = ((self.player_angle - 90) as f64) * std::f64::consts::PI / 180.0;
             let speed = cmd.sidemove as f64 * 2.0;
-            self.player_x += (speed * angle_rad.cos()) as i32;
-            self.player_y += (speed * angle_rad.sin()) as i32;
+            dx += speed * angle_rad.cos();
+            dy += speed * angle_rad.sin();
         }
+
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+
+        let new_x = self.player_x + dx as i32;
+        let new_y = self.player_y + dy as i32;
+
+        // Raio do jogador (16 unidades, como no DOOM original)
+        let radius = 16;
+
+        // P_TryMove: checar colisao com linedefs do mapa
+        if self.check_line_collision(new_x, new_y, radius) {
+            // Bloqueado — tentar slide em cada eixo separadamente
+            // (simplificacao de P_SlideMove)
+            if !self.check_line_collision(new_x, self.player_y, radius) {
+                self.player_x = new_x;
+            } else if !self.check_line_collision(self.player_x, new_y, radius) {
+                self.player_y = new_y;
+            }
+            // Se ambos bloqueados, nao mover
+        } else {
+            self.player_x = new_x;
+            self.player_y = new_y;
+        }
+    }
+
+    /// Verifica se a posicao (x, y) com dado raio colide com
+    /// alguma linedef solida do mapa.
+    ///
+    /// Checa linedefs one-sided (paredes) e two-sided sem gap
+    /// suficiente para passagem (portas fechadas, etc.).
+    ///
+    /// C original: `P_CheckPosition()` + `PIT_CheckLine()` em `p_map.c`
+    fn check_line_collision(&self, x: i32, y: i32, radius: i32) -> bool {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return false,
+        };
+
+        // Bounding box do jogador
+        let left = x - radius;
+        let right = x + radius;
+        let bottom = y - radius;
+        let top = y + radius;
+
+        for ld in &map.linedefs {
+            let v1x = map.vertexes[ld.v1].x.to_int();
+            let v1y = map.vertexes[ld.v1].y.to_int();
+            let v2x = map.vertexes[ld.v2].x.to_int();
+            let v2y = map.vertexes[ld.v2].y.to_int();
+
+            // Quick reject: AABB da linedef vs AABB do jogador
+            let line_left = v1x.min(v2x);
+            let line_right = v1x.max(v2x);
+            let line_bottom = v1y.min(v2y);
+            let line_top = v1y.max(v2y);
+
+            if right <= line_left || left > line_right
+                || top <= line_bottom || bottom > line_top
+            {
+                // Bounding boxes nao se sobrepoem — ignora +1 para linhas finas
+                if (line_left == line_right || line_bottom == line_top)
+                    && (right < line_left - radius || left > line_right + radius
+                        || top < line_bottom - radius || bottom > line_top + radius)
+                {
+                    continue;
+                }
+                if line_left != line_right && line_bottom != line_top {
+                    continue;
+                }
+            }
+
+            // Linedef one-sided = parede solida (bloqueante)
+            let is_blocking = !ld.flags.contains(crate::map::types::LineDefFlags::TWO_SIDED)
+                || ld.flags.contains(crate::map::types::LineDefFlags::BLOCKING);
+
+            if !is_blocking {
+                continue;
+            }
+
+            // Distancia ponto-segmento: se o jogador esta proximo
+            // demais da linedef, bloquear
+            let dist = point_to_line_dist(x, y, v1x, v1y, v2x, v2y);
+            if dist < radius as f64 {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Retorna o numero de ticks por segundo.
@@ -896,6 +992,32 @@ impl DoomEngine {
         log::info!("I_Quit: Encerrando engine.");
         self.running = false;
     }
+}
+
+/// Calcula a distancia minima de um ponto a um segmento de reta.
+///
+/// Usado para colisao do jogador com linedefs.
+fn point_to_line_dist(px: i32, py: i32, x1: i32, y1: i32, x2: i32, y2: i32) -> f64 {
+    let dx = (x2 - x1) as f64;
+    let dy = (y2 - y1) as f64;
+    let len_sq = dx * dx + dy * dy;
+
+    if len_sq == 0.0 {
+        // Segmento degenerado (ponto)
+        let ex = (px - x1) as f64;
+        let ey = (py - y1) as f64;
+        return (ex * ex + ey * ey).sqrt();
+    }
+
+    // Projecao do ponto no segmento (parametro t clamped a [0,1])
+    let t = (((px - x1) as f64 * dx + (py - y1) as f64 * dy) / len_sq).clamp(0.0, 1.0);
+
+    let proj_x = x1 as f64 + t * dx;
+    let proj_y = y1 as f64 + t * dy;
+
+    let ex = px as f64 - proj_x;
+    let ey = py as f64 - proj_y;
+    (ex * ex + ey * ey).sqrt()
 }
 
 /// Desenha uma linha no framebuffer usando algoritmo de Bresenham.
