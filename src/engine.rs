@@ -326,7 +326,7 @@ impl DoomEngine {
         self.update_display_config();
 
         // D_Display — renderizar frame
-        // (na versao completa, chamaria R_RenderPlayerView, drawers, etc.)
+        self.d_display();
 
         // Atualizar wipe
         if self.wipe.is_active() {
@@ -431,6 +431,173 @@ impl DoomEngine {
         self.game.state
     }
 
+    /// Renderiza o frame atual no framebuffer.
+    ///
+    /// Seleciona o drawer apropriado conforme o estado do jogo:
+    /// - Level: automap top-down do mapa carregado
+    /// - DemoScreen: TITLEPIC do WAD ou padrao de teste
+    /// - Intermission/Finale: padrao com cor de fundo
+    ///
+    /// C original: `D_Display()` em `d_main.c`
+    fn d_display(&mut self) {
+        match self.game.state {
+            GameStateType::Level => {
+                self.draw_automap();
+            }
+            GameStateType::DemoScreen => {
+                self.draw_title_screen();
+            }
+            GameStateType::Intermission => {
+                // Tela de intermissao — cor de fundo azul escuro
+                let screen = self.video.screen_mut(0);
+                for pixel in screen.iter_mut() {
+                    *pixel = 0xC7; // azul escuro na paleta DOOM
+                }
+            }
+            GameStateType::Finale => {
+                // Tela de finale — cor de fundo preto
+                let screen = self.video.screen_mut(0);
+                for pixel in screen.iter_mut() {
+                    *pixel = 0;
+                }
+            }
+        }
+    }
+
+    /// Desenha a tela de titulo (TITLEPIC) do WAD.
+    ///
+    /// Tenta carregar o lump TITLEPIC como um flat raw de 320x200.
+    /// Se nao encontrar, desenha um padrao de teste colorido.
+    ///
+    /// C original: `D_PageDrawer()` em `d_main.c`
+    fn draw_title_screen(&mut self) {
+        // Tentar carregar TITLEPIC como raw 320x200
+        if let Ok(data) = self.wad.read_lump_by_name("TITLEPIC") {
+            let screen = self.video.screen_mut(0);
+            let copy_len = data.len().min(screen.len());
+            screen[..copy_len].copy_from_slice(&data[..copy_len]);
+            return;
+        }
+
+        // Fallback: padrao de teste para verificar que o pipeline funciona
+        self.draw_test_pattern();
+    }
+
+    /// Desenha um padrao de teste colorido no framebuffer.
+    ///
+    /// Barras verticais usando diferentes indices da paleta DOOM.
+    /// Util para verificar que o pipeline video esta funcionando.
+    fn draw_test_pattern(&mut self) {
+        let screen = self.video.screen_mut(0);
+        let w = crate::video::SCREENWIDTH;
+        let h = crate::video::SCREENHEIGHT;
+
+        for y in 0..h {
+            for x in 0..w {
+                // Barras verticais coloridas (16 barras de 20px)
+                let bar = x / 20;
+                // Usar diferentes rampas de cor da paleta DOOM
+                let brightness = (y * 16 / h) as u8;
+                let color = (bar as u8 * 16).wrapping_add(brightness);
+                screen[y * w + x] = color;
+            }
+        }
+    }
+
+    /// Desenha uma vista automap (top-down) do mapa carregado.
+    ///
+    /// Renderiza as linedefs do mapa como linhas coloridas no
+    /// framebuffer, similar ao automap do DOOM (tecla TAB).
+    /// Paredes one-sided em vermelho, two-sided em cinza/marrom.
+    ///
+    /// C original: `AM_Drawer()` em `am_map.c`
+    fn draw_automap(&mut self) {
+        let w = crate::video::SCREENWIDTH;
+        let h = crate::video::SCREENHEIGHT;
+
+        // Limpar tela com cor de fundo escura
+        let screen = self.video.screen_mut(0);
+        for pixel in screen.iter_mut() {
+            *pixel = 0; // preto
+        }
+
+        // Precisamos do mapa para desenhar
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+
+        if map.vertexes.is_empty() || map.linedefs.is_empty() {
+            return;
+        }
+
+        // Calcular bounding box do mapa (em fixed-point)
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+
+        for v in &map.vertexes {
+            min_x = min_x.min(v.x.0);
+            max_x = max_x.max(v.x.0);
+            min_y = min_y.min(v.y.0);
+            max_y = max_y.max(v.y.0);
+        }
+
+        let map_width = max_x - min_x;
+        let map_height = max_y - min_y;
+
+        if map_width <= 0 || map_height <= 0 {
+            return;
+        }
+
+        // Margem de 10 pixels em cada lado
+        let margin = 10;
+        let view_w = (w - margin * 2) as i64;
+        let view_h = (h - margin * 2) as i64;
+
+        // Escala: manter aspect ratio
+        let scale_x = (view_w << 16) / map_width as i64;
+        let scale_y = (view_h << 16) / map_height as i64;
+        let scale = scale_x.min(scale_y);
+
+        // Centro do mapa na tela
+        let center_x = w as i64 / 2;
+        let center_y = h as i64 / 2;
+        let map_center_x = (min_x as i64 + max_x as i64) / 2;
+        let map_center_y = (min_y as i64 + max_y as i64) / 2;
+
+        // Converter coordenada do mapa para pixel na tela
+        let to_screen = |mx: i32, my: i32| -> (i32, i32) {
+            let sx = center_x + (((mx as i64 - map_center_x) * scale) >> 16);
+            // Y invertido: no DOOM y cresce para cima, na tela para baixo
+            let sy = center_y - (((my as i64 - map_center_y) * scale) >> 16);
+            (sx as i32, sy as i32)
+        };
+
+        // Desenhar cada linedef como uma linha
+        // Copiar dados necessarios para evitar borrow conflict
+        let lines: Vec<_> = map.linedefs.iter().map(|ld| {
+            let v1 = map.vertexes[ld.v1];
+            let v2 = map.vertexes[ld.v2];
+            let two_sided = ld.flags.contains(crate::map::types::LineDefFlags::TWO_SIDED);
+            (v1, v2, two_sided)
+        }).collect();
+
+        let screen = self.video.screen_mut(0);
+
+        for (v1, v2, two_sided) in &lines {
+            let (x1, y1) = to_screen(v1.x.0, v1.y.0);
+            let (x2, y2) = to_screen(v2.x.0, v2.y.0);
+
+            // Cor: vermelho para one-sided, cinza escuro para two-sided
+            let color: u8 = if *two_sided { 0x60 } else { 0xAC };
+
+            // Bresenham line drawing
+            draw_line(screen, w, h, x1, y1, x2, y2, color);
+        }
+    }
+
     /// Retorna o framebuffer principal (screen 0) para blit.
     pub fn framebuffer(&self) -> &[u8] {
         self.video.screen(0)
@@ -441,6 +608,51 @@ impl DoomEngine {
         log::info!("D_QuitNetGame: Encerrando rede...");
         log::info!("I_Quit: Encerrando engine.");
         self.running = false;
+    }
+}
+
+/// Desenha uma linha no framebuffer usando algoritmo de Bresenham.
+///
+/// Clippa coordenadas contra os limites da tela antes de desenhar.
+#[allow(clippy::too_many_arguments)]
+fn draw_line(
+    screen: &mut [u8],
+    screen_w: usize,
+    screen_h: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: u8,
+) {
+    let mut x0 = x0;
+    let mut y0 = y0;
+
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx: i32 = if x0 < x1 { 1 } else { -1 };
+    let sy: i32 = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        // Desenhar pixel se dentro da tela
+        if x0 >= 0 && x0 < screen_w as i32 && y0 >= 0 && y0 < screen_h as i32 {
+            screen[y0 as usize * screen_w + x0 as usize] = color;
+        }
+
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
     }
 }
 
