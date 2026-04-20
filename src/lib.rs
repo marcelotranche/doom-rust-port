@@ -21,6 +21,8 @@
 //! ## Codigo C Original
 //! Fonte primaria: Linuxdoom 1.10 (`references/DOOM-master/linuxdoom-1.10/`)
 
+pub mod args;
+pub mod engine;
 pub mod game;
 pub mod map;
 pub mod menu;

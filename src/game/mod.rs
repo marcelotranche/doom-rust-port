@@ -45,6 +45,7 @@
 //! - `p_maputl.c` — Blockmap, utilidades de mapa
 //! - `info.h` / `info.c` — Tabelas de estados e mobjinfo
 
+pub mod display;
 pub mod events;
 pub mod info;
 pub mod input;
@@ -54,3 +55,4 @@ pub mod movement;
 pub mod state;
 pub mod thinker;
 pub mod tick;
+pub mod ticker;
