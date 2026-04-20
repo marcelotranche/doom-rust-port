@@ -123,7 +123,14 @@ $(FREEDOOM_WAD):
 	@echo "Baixando Freedoom $(FREEDOOM_VER)..."
 	@mkdir -p assets
 	@curl -L -o /tmp/freedoom.zip $(FREEDOOM_URL)
-	@unzip -o -j /tmp/freedoom.zip "freedoom-$(FREEDOOM_VER)/freedoom1.wad" -d assets/
+	@python3 -c "\
+	import zipfile, shutil, os; \
+	z = zipfile.ZipFile('/tmp/freedoom.zip'); \
+	src = 'freedoom-$(FREEDOOM_VER)/freedoom1.wad'; \
+	f = z.open(src); \
+	out = open('assets/freedoom1.wad', 'wb'); \
+	shutil.copyfileobj(f, out); \
+	f.close(); out.close(); z.close()"
 	@rm -f /tmp/freedoom.zip
 	@echo "Freedoom instalado em $(FREEDOOM_WAD)"
 

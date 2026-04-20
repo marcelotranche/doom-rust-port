@@ -18,14 +18,22 @@ Voce tem duas opcoes:
 Baixe o Freedoom, um projeto de assets livres compativeis com o DOOM:
 
 ```bash
-# Baixar Freedoom 0.13.0
-curl -L -o freedoom.zip \
-    https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip
+# Via Makefile (recomendado — baixa e extrai automaticamente)
+make freedoom
 
-# Extrair o WAD
-unzip freedoom.zip "freedoom-0.13.0/freedoom1.wad"
-mv freedoom-0.13.0/freedoom1.wad assets/
-rm -rf freedoom-0.13.0 freedoom.zip
+# Ou manualmente:
+mkdir -p assets
+curl -L -o /tmp/freedoom.zip \
+    https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip
+python3 -c "
+import zipfile, shutil
+z = zipfile.ZipFile('/tmp/freedoom.zip')
+with z.open('freedoom-0.13.0/freedoom1.wad') as src, \
+     open('assets/freedoom1.wad', 'wb') as dst:
+    shutil.copyfileobj(src, dst)
+z.close()
+"
+rm -f /tmp/freedoom.zip
 ```
 
 ### Opcao 2: DOOM original (se voce possui)
