@@ -20,6 +20,10 @@ use doom_rust::engine::DoomEngine;
 fn main() {
     env_logger::init();
 
+    println!("DOOM Rust v{}", env!("CARGO_PKG_VERSION"));
+    println!("Port educacional do DOOM (1993) para Rust");
+    println!();
+
     // Parse de argumentos
     let args = match DoomArgs::parse() {
         Ok(args) => args,
@@ -36,6 +40,7 @@ fn main() {
     };
 
     // Inicializar engine (D_DoomMain)
+    println!("D_DoomMain: Inicializando...");
     let mut engine = match DoomEngine::init(&args) {
         Ok(engine) => engine,
         Err(e) => {
@@ -44,11 +49,32 @@ fn main() {
         }
     };
 
+    println!("D_DoomMain: Inicializacao completa.");
+    println!(
+        "  Estado: {:?} | Skill: {:?} | E{}M{}",
+        engine.state(),
+        engine.game.skill,
+        engine.game.episode,
+        engine.game.map,
+    );
+
+    if let Some(ref map) = engine.map {
+        println!(
+            "  Mapa carregado: {} vertexes, {} linedefs, {} sectors, {} things",
+            map.vertexes.len(),
+            map.linedefs.len(),
+            map.sectors.len(),
+            map.things.len(),
+        );
+    }
+
+    println!();
+
     // Game loop (D_DoomLoop)
     // Na versao completa, este loop seria integrado com SDL2
     // para rendering real e input de hardware.
-    log::info!(
-        "D_DoomLoop: Iniciando game loop a {} Hz",
+    println!(
+        "D_DoomLoop: Iniciando game loop a {} Hz...",
         engine.ticrate()
     );
 
@@ -61,14 +87,19 @@ fn main() {
 
         // Por enquanto, rodar um numero limitado de frames
         // para nao travar sem SDL2
-        if engine.gametic() >= 3 {
-            log::info!(
-                "D_DoomLoop: {} ticks executados (sem SDL2, encerrando)",
-                engine.gametic()
-            );
+        if engine.gametic() >= 35 {
             break;
         }
     }
 
+    println!(
+        "D_DoomLoop: {} ticks executados (~{:.1}s de jogo simulados)",
+        engine.gametic(),
+        engine.gametic() as f64 / engine.ticrate() as f64,
+    );
+
     engine.quit();
+    println!();
+    println!("DOOM Rust encerrado.");
+    println!("(Rendering visual requer compilacao com feature SDL2: cargo run --features sdl)");
 }
