@@ -1690,6 +1690,43 @@ impl DoomEngine {
             let has_upper = !is_solid && worldhigh_full < worldtop_full;
             let has_lower = !is_solid && worldlow_full > worldbottom_full;
 
+            // markceiling / markfloor: determinar se flat deve ser renderizado
+            // C original: r_segs.c linhas 461, 537-567, 665-676
+            let (mut mark_ceiling, mut mark_floor) = if is_solid {
+                (true, true)
+            } else if let Some(back_idx) = seg.back_sector {
+                if back_idx < map.sectors.len() {
+                    let back = &map.sectors[back_idx];
+                    let mut mc = worldhigh_full != worldtop_full
+                        || back.ceiling_pic != front_sector.ceiling_pic
+                        || back.light_level != front_sector.light_level;
+                    let mut mf = worldlow_full != worldbottom_full
+                        || back.floor_pic != front_sector.floor_pic
+                        || back.light_level != front_sector.light_level;
+                    // Closed door: ambos marcados
+                    if back.ceiling_height.0 <= front_sector.floor_height.0
+                        || back.floor_height.0 >= front_sector.ceiling_height.0
+                    {
+                        mc = true;
+                        mf = true;
+                    }
+                    (mc, mf)
+                } else {
+                    (true, true)
+                }
+            } else {
+                (true, true)
+            };
+
+            // Se o plano esta do lado errado do viewplane, nao renderizar
+            // C original: r_segs.c linhas 665-676
+            if front_sector.floor_height.0 >= self.render_state.viewz.0 {
+                mark_floor = false;
+            }
+            if front_sector.ceiling_height.0 <= self.render_state.viewz.0 {
+                mark_ceiling = false;
+            }
+
             // Shift para HEIGHTBITS (>> 4) apos comparacoes
             let worldtop = worldtop_full >> 4;
             let worldbottom = worldbottom_full >> 4;
@@ -1912,13 +1949,17 @@ impl DoomEngine {
                     // --- Parede solida (one-sided) ---
 
                     // Teto com textura flat
-                    let ct = (ceilingclip[xu] as i32 + 1).max(0);
-                    let cb = (yl - 1).min(sh - 1);
-                    Self::draw_flat_column(
-                        screen, xu, ct, cb, ceil_flat, ceil_color_fb,
-                        (ceil_h - viewz).abs(), planes, &self.render_state,
-                        lightnum, colormaps_ref,
-                    );
+                    if mark_ceiling {
+                        let ct = (ceilingclip[xu] as i32 + 1).max(0);
+                        let cb = (yl - 1).min(sh - 1);
+                        if ct <= cb {
+                            Self::draw_flat_column(
+                                screen, xu, ct, cb, ceil_flat, ceil_color_fb,
+                                (ceil_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
+                    }
 
                     // Parede com textura
                     if let Some(tex_idx) = mid_tex {
@@ -1943,34 +1984,61 @@ impl DoomEngine {
                     }
 
                     // Piso com textura flat
-                    let ft = (yh + 1).max(0);
-                    let fb = (floorclip[xu] as i32 - 1).min(sh - 1);
-                    Self::draw_flat_column(
-                        screen, xu, ft, fb, floor_flat, floor_color_fb,
-                        (floor_h - viewz).abs(), planes, &self.render_state,
-                        lightnum, colormaps_ref,
-                    );
+                    if mark_floor {
+                        let ft = (yh + 1).max(0);
+                        let fb = (floorclip[xu] as i32 - 1).min(sh - 1);
+                        if ft <= fb {
+                            Self::draw_flat_column(
+                                screen, xu, ft, fb, floor_flat, floor_color_fb,
+                                (floor_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
+                    }
 
                     ceilingclip[xu] = sh as i16;
                     floorclip[xu] = -1;
                 } else {
                     // --- Parede two-sided ---
+                    // C original: R_RenderSegLoop linhas 228-358
 
-                    // Teto com textura flat
-                    let mark_ceiling = worldhigh_full != worldtop_full || has_upper;
+                    // Teto com textura flat (ANTES de modificar ceilingclip)
                     if mark_ceiling {
                         let ct = (ceilingclip[xu] as i32 + 1).max(0);
-                        let cb = (yl - 1).min(sh - 1);
-                        Self::draw_flat_column(
-                            screen, xu, ct, cb, ceil_flat, ceil_color_fb,
-                            (ceil_h - viewz).abs(), planes, &self.render_state,
-                            lightnum, colormaps_ref,
-                        );
+                        let mut cb = yl - 1;
+                        if cb >= floorclip[xu] as i32 {
+                            cb = floorclip[xu] as i32 - 1;
+                        }
+                        if ct <= cb {
+                            Self::draw_flat_column(
+                                screen, xu, ct, cb, ceil_flat, ceil_color_fb,
+                                (ceil_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
+                    }
+
+                    // Piso com textura flat (ANTES de modificar floorclip)
+                    if mark_floor {
+                        let mut ft = yh + 1;
+                        let fb = floorclip[xu] as i32 - 1;
+                        if ft <= ceilingclip[xu] as i32 {
+                            ft = ceilingclip[xu] as i32 + 1;
+                        }
+                        if ft <= fb {
+                            Self::draw_flat_column(
+                                screen, xu, ft, fb, floor_flat, floor_color_fb,
+                                (floor_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
                     }
 
                     // Upper wall
                     if has_upper {
                         let mut mid = pixhigh >> 12;
+                        pixhigh += pixhighstep;
+
                         if mid >= floorclip[xu] as i32 {
                             mid = floorclip[xu] as i32 - 1;
                         }
@@ -1999,13 +2067,16 @@ impl DoomEngine {
                         } else {
                             ceilingclip[xu] = (yl - 1) as i16;
                         }
-                    } else {
+                    } else if mark_ceiling {
+                        // Sem upper wall mas com ceiling marcado
                         ceilingclip[xu] = (yl - 1) as i16;
                     }
 
                     // Lower wall
                     if has_lower {
                         let mut mid = (pixlow + 0xFFF) >> 12;
+                        pixlow += pixlowstep;
+
                         if mid <= ceilingclip[xu] as i32 {
                             mid = ceilingclip[xu] as i32 + 1;
                         }
@@ -2034,33 +2105,18 @@ impl DoomEngine {
                         } else {
                             floorclip[xu] = (yh + 1) as i16;
                         }
-                    } else {
+                    } else if mark_floor {
+                        // Sem lower wall mas com floor marcado
                         floorclip[xu] = (yh + 1) as i16;
                     }
-
-                    // Piso com textura flat
-                    let mark_floor = worldlow_full != worldbottom_full || has_lower;
-                    if mark_floor {
-                        let ft = (yh + 1).max(0);
-                        let old_fc = floorclip[xu] as i32;
-                        let fb = old_fc.min(sh) - 1;
-                        Self::draw_flat_column(
-                            screen, xu, ft, fb, floor_flat, floor_color_fb,
-                            (floor_h - viewz).abs(), planes, &self.render_state,
-                            lightnum, colormaps_ref,
-                        );
-                    }
                 }
 
+                // Stepping (C original: r_segs.c linhas 360-362)
+                // Nota: pixhigh/pixlow sao incrementados inline nos blocos
+                // upper/lower acima, como no C original
+                cur_scale += rw_scalestep;
                 topfrac += topstep;
                 bottomfrac += bottomstep;
-                cur_scale += rw_scalestep;
-                if has_upper {
-                    pixhigh += pixhighstep;
-                }
-                if has_lower {
-                    pixlow += pixlowstep;
-                }
             }
         }
     }
