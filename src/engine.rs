@@ -531,17 +531,19 @@ impl DoomEngine {
             return;
         }
 
-        // Calcular bounding box do mapa (em fixed-point)
+        // Calcular bounding box do mapa (em coordenadas inteiras)
         let mut min_x = i32::MAX;
         let mut max_x = i32::MIN;
         let mut min_y = i32::MAX;
         let mut max_y = i32::MIN;
 
         for v in &map.vertexes {
-            min_x = min_x.min(v.x.0);
-            max_x = max_x.max(v.x.0);
-            min_y = min_y.min(v.y.0);
-            max_y = max_y.max(v.y.0);
+            let ix = v.x.to_int();
+            let iy = v.y.to_int();
+            min_x = min_x.min(ix);
+            max_x = max_x.max(ix);
+            min_y = min_y.min(iy);
+            max_y = max_y.max(iy);
         }
 
         let map_width = max_x - min_x;
@@ -553,26 +555,26 @@ impl DoomEngine {
 
         // Margem de 10 pixels em cada lado
         let margin = 10;
-        let view_w = (w - margin * 2) as i64;
-        let view_h = (h - margin * 2) as i64;
+        let view_w = (w - margin * 2) as i32;
+        let view_h = (h - margin * 2) as i32;
 
-        // Escala: manter aspect ratio
-        let scale_x = (view_w << 16) / map_width as i64;
-        let scale_y = (view_h << 16) / map_height as i64;
+        // Escala: pixels por unidade de mapa (fixed-point 16.16)
+        let scale_x = ((view_w as i64) << 16) / map_width as i64;
+        let scale_y = ((view_h as i64) << 16) / map_height as i64;
         let scale = scale_x.min(scale_y);
 
         // Centro do mapa na tela
-        let center_x = w as i64 / 2;
-        let center_y = h as i64 / 2;
-        let map_center_x = (min_x as i64 + max_x as i64) / 2;
-        let map_center_y = (min_y as i64 + max_y as i64) / 2;
+        let center_x = w as i32 / 2;
+        let center_y = h as i32 / 2;
+        let map_center_x = (min_x + max_x) / 2;
+        let map_center_y = (min_y + max_y) / 2;
 
-        // Converter coordenada do mapa para pixel na tela
+        // Converter coordenada do mapa (inteira) para pixel na tela
         let to_screen = |mx: i32, my: i32| -> (i32, i32) {
-            let sx = center_x + (((mx as i64 - map_center_x) * scale) >> 16);
+            let sx = center_x + (((mx - map_center_x) as i64 * scale) >> 16) as i32;
             // Y invertido: no DOOM y cresce para cima, na tela para baixo
-            let sy = center_y - (((my as i64 - map_center_y) * scale) >> 16);
-            (sx as i32, sy as i32)
+            let sy = center_y - (((my - map_center_y) as i64 * scale) >> 16) as i32;
+            (sx, sy)
         };
 
         // Desenhar cada linedef como uma linha
@@ -581,17 +583,17 @@ impl DoomEngine {
             let v1 = map.vertexes[ld.v1];
             let v2 = map.vertexes[ld.v2];
             let two_sided = ld.flags.contains(crate::map::types::LineDefFlags::TWO_SIDED);
-            (v1, v2, two_sided)
+            (v1.x.to_int(), v1.y.to_int(), v2.x.to_int(), v2.y.to_int(), two_sided)
         }).collect();
 
         let screen = self.video.screen_mut(0);
 
-        for (v1, v2, two_sided) in &lines {
-            let (x1, y1) = to_screen(v1.x.0, v1.y.0);
-            let (x2, y2) = to_screen(v2.x.0, v2.y.0);
+        for &(v1x, v1y, v2x, v2y, two_sided) in &lines {
+            let (x1, y1) = to_screen(v1x, v1y);
+            let (x2, y2) = to_screen(v2x, v2y);
 
             // Cor: vermelho para one-sided, cinza escuro para two-sided
-            let color: u8 = if *two_sided { 0x60 } else { 0xAC };
+            let color: u8 = if two_sided { 0x60 } else { 0xAC };
 
             // Bresenham line drawing
             draw_line(screen, w, h, x1, y1, x2, y2, color);
