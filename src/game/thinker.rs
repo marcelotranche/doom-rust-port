@@ -32,11 +32,15 @@
 pub trait Thinker: std::fmt::Debug {
     /// Executa a logica de um tick para este thinker.
     ///
+    /// Recebe acesso mutavel aos sectors do mapa, permitindo que
+    /// portas/elevadores/pisos modifiquem alturas diretamente.
+    /// No C original, thinkers tinham ponteiros diretos para sectors.
+    ///
     /// Retorna `true` se o thinker deve continuar ativo,
     /// `false` se deve ser removido na proxima limpeza.
     ///
     /// C original: `thinker->function.acp1(thinker)` em `p_tick.c`
-    fn think(&mut self) -> bool;
+    fn think(&mut self, sectors: &mut [crate::map::types::Sector]) -> bool;
 }
 
 /// Lista de thinkers ativos — gerencia todos os objetos "pensantes".
@@ -85,11 +89,11 @@ impl ThinkerList {
     /// Ao final, remove todos os slots marcados.
     ///
     /// C original: `P_RunThinkers()` em `p_tick.c`
-    pub fn run(&mut self) {
+    pub fn run(&mut self, sectors: &mut [crate::map::types::Sector]) {
         // Executar cada thinker ativo
         for i in 0..self.thinkers.len() {
             if let Some(thinker) = &mut self.thinkers[i] {
-                if !thinker.think() {
+                if !thinker.think(sectors) {
                     self.thinkers[i] = None;
                 }
             }
@@ -148,7 +152,7 @@ mod tests {
     }
 
     impl Thinker for CounterThinker {
-        fn think(&mut self) -> bool {
+        fn think(&mut self, _sectors: &mut [crate::map::types::Sector]) -> bool {
             self.count += 1;
             self.count < self.max
         }
@@ -162,17 +166,17 @@ mod tests {
         assert_eq!(list.count(), 2);
 
         // Executar 2 ticks
-        list.run();
-        list.run();
+        list.run(&mut []);
+        list.run(&mut []);
         assert_eq!(list.count(), 2); // ambos ainda ativos
 
         // No tick 3, o segundo thinker (max=3) retorna false
-        list.run();
+        list.run(&mut []);
         assert_eq!(list.count(), 1); // segundo removido
 
         // Ticks 4 e 5
-        list.run();
-        list.run();
+        list.run(&mut []);
+        list.run(&mut []);
         assert_eq!(list.count(), 0); // primeiro removido
     }
 
@@ -186,7 +190,7 @@ mod tests {
         list.remove(0);
         assert_eq!(list.count(), 1); // marcado, nao compactado ainda
 
-        list.run();
+        list.run(&mut []);
         assert_eq!(list.count(), 1); // compactado + tick do restante
     }
 

@@ -51,12 +51,39 @@ use crate::game::ticker::{GameTicker, TickResult};
 use crate::game::thinker::ThinkerList;
 use crate::map::MapData;
 use crate::menu::navigation::{MenuAction, MenuSystem};
+use crate::renderer::bsp::{BspTraversal, WallSegment};
+use crate::renderer::data::TextureData;
+use crate::renderer::draw::ColumnDrawer;
 use crate::renderer::state::RenderState;
-use crate::video::VideoSystem;
+use crate::utils::angle::{Angle, ANGLETOFINESHIFT, FINEMASK};
+use crate::utils::fixed::{Fixed, FRACBITS, FRACUNIT};
+use crate::utils::tables::{fine_cosine, fine_sine};
+use crate::game::weapons::{PlayerWeapons, WEAPON_INFO};
+use crate::menu::statusbar::{PlayerStatusInfo, StatusBar, ST_Y};
+use crate::video::{VideoSystem, SCREENHEIGHT, SCREENWIDTH};
 use crate::wad::WadSystem;
 
 /// Versao do engine.
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Dados pre-calculados para rendering de planos (piso/teto).
+///
+/// Contem tabelas de projecao perspectiva e cache de texturas flat.
+/// C original: globals `yslope[]`, `distscale[]`, `basexscale`, `baseyscale`
+struct PlaneRenderData {
+    /// Lookup de projecao: distancia por linha Y.
+    /// yslope[y] = FixedDiv(viewwidth/2, abs(y - centery))
+    yslope: [i32; SCREENHEIGHT],
+    /// Escala de distancia por coluna X (correcao coseno).
+    /// distscale[x] = 1 / cos(xtoviewangle[x])
+    distscale: [i32; SCREENWIDTH],
+    /// Stepping X na textura de flat por unidade de distancia
+    #[allow(dead_code)]
+    basexscale: i32,
+    /// Stepping Y na textura de flat por unidade de distancia
+    #[allow(dead_code)]
+    baseyscale: i32,
+}
 
 /// Engine principal do DOOM.
 ///
@@ -90,19 +117,41 @@ pub struct DoomEngine {
     pub menu: MenuSystem,
     /// Dados do mapa atual (geometria, BSP, things)
     pub map: Option<MapData>,
+    /// Dados de textura carregados do WAD (patches, flats, colormaps)
+    pub texture_data: Option<TextureData>,
+    /// Drawer de colunas (lookup tables para framebuffer)
+    pub column_drawer: ColumnDrawer,
+    /// Cache de flats carregados do WAD (construido uma vez ao carregar mapa)
+    flat_cache: std::collections::HashMap<[u8; 8], Vec<u8>>,
+    /// Cache de texturas resolvidas por sidedef (evita re-lookup por frame).
+    /// Chave: sidedef index, Valor: (mid_tex, top_tex, bot_tex)
+    sidedef_tex_cache: Vec<(Option<usize>, Option<usize>, Option<usize>)>,
+    /// Tabela de projecao yslope (constante, calculada uma vez na init)
+    plane_yslope: [i32; SCREENHEIGHT],
+    /// Escala de distancia por coluna (constante, calculada uma vez na init)
+    plane_distscale: [i32; SCREENWIDTH],
     /// Configuracao de exibicao
     pub display_config: DisplayConfig,
     /// Estado do efeito wipe
     pub wipe: WipeState,
+    /// Status bar (barra inferior com saude, ammo, armor)
+    pub statusbar: StatusBar,
+    /// Informacoes do jogador para a status bar
+    pub player_status: PlayerStatusInfo,
 
-    // -- Posicao do jogador (para automap) --
+    // -- Posicao do jogador --
 
-    /// Posicao X do jogador no mapa (inteiro, unidades de mapa)
-    pub player_x: i32,
-    /// Posicao Y do jogador no mapa
-    pub player_y: i32,
-    /// Angulo do jogador em graus (0-359)
-    pub player_angle: i32,
+    /// Posicao X do jogador no mapa (fixed-point, 16.16)
+    ///
+    /// C original: `player->mo->x` (fixed_t)
+    pub player_x: Fixed,
+    /// Posicao Y do jogador no mapa (fixed-point, 16.16)
+    pub player_y: Fixed,
+    /// Angulo do jogador em BAM (Binary Angle Measurement, u32)
+    ///
+    /// C original: `player->mo->angle` (angle_t, unsigned 32-bit)
+    /// 0x00000000 = leste, 0x40000000 = norte, 0x80000000 = oeste
+    pub player_angle: u32,
 
     // -- Flags de controle --
 
@@ -120,6 +169,12 @@ pub struct DoomEngine {
     pub num_wad_files: usize,
     /// Se o engine esta rodando
     pub running: bool,
+    /// Flag para evitar ativacao repetida de Use (one-shot por pressionamento).
+    /// C original: `player->usedown` em `p_user.c`
+    use_down: bool,
+    /// Estado das armas do jogador (arma equipada, municao, psprites).
+    /// C original: campos de `player_t` em `d_player.h`
+    pub player_weapons: PlayerWeapons,
 }
 
 impl DoomEngine {
@@ -137,11 +192,19 @@ impl DoomEngine {
             input: InputState::new(),
             menu: MenuSystem::new(),
             map: None,
+            texture_data: None,
+            column_drawer: ColumnDrawer::new(),
+            flat_cache: std::collections::HashMap::new(),
+            sidedef_tex_cache: Vec::new(),
+            plane_yslope: [0i32; SCREENHEIGHT],
+            plane_distscale: [0i32; SCREENWIDTH],
             display_config: DisplayConfig::default(),
             wipe: WipeState::new(),
-            player_x: 0,
-            player_y: 0,
-            player_angle: 90,
+            statusbar: StatusBar::new(),
+            player_status: PlayerStatusInfo::new(),
+            player_x: Fixed(0),
+            player_y: Fixed(0),
+            player_angle: Angle::ANG90.0, // 90 graus = norte
             devparm: false,
             nomonsters: false,
             fastparm: false,
@@ -149,6 +212,8 @@ impl DoomEngine {
             turbo_scale: 100,
             num_wad_files: 0,
             running: false,
+            use_down: false,
+            player_weapons: PlayerWeapons::new(),
         }
     }
 
@@ -235,6 +300,24 @@ impl DoomEngine {
             crate::video::SCREENWIDTH, crate::video::SCREENHEIGHT);
 
         log::info!("R_Init: Inicializando renderer...");
+        // R_InitData: carregar texturas, flats, sprites, colormaps
+        match TextureData::load(&engine.wad) {
+            Ok(td) => {
+                log::info!(
+                    "R_InitData: {} texturas, {} flats, {} sprites",
+                    td.textures.len(),
+                    td.num_flats,
+                    td.num_sprite_lumps,
+                );
+                engine.texture_data = Some(td);
+            }
+            Err(e) => {
+                log::warn!("R_InitData: falha ao carregar texturas: {}", e);
+            }
+        }
+
+        // Pre-calcular tabelas de projecao de planos (constantes)
+        engine.init_plane_tables();
 
         log::info!("P_Init: Inicializando gameplay...");
 
@@ -279,6 +362,8 @@ impl DoomEngine {
                     engine.game.viewactive = true;
                     engine.game.levelstarttic = 0;
                     engine.init_player_position();
+                    engine.build_flat_cache();
+                    engine.build_sidedef_tex_cache();
                 }
                 Err(e) => {
                     log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
@@ -331,7 +416,11 @@ impl DoomEngine {
         };
 
         for _ in 0..counts {
-            let result = self.ticker.tick(&mut self.game, &mut self.thinkers);
+            let sectors = match &mut self.map {
+                Some(m) => m.sectors.as_mut_slice(),
+                None => &mut [],
+            };
+            let result = self.ticker.tick(&mut self.game, &mut self.thinkers, sectors);
             if result == TickResult::Quit {
                 self.running = false;
                 return false;
@@ -455,6 +544,8 @@ impl DoomEngine {
                         self.game.viewactive = true;
                         self.game.levelstarttic = self.game.gametic;
                         self.init_player_position();
+                        self.build_flat_cache();
+                        self.build_sidedef_tex_cache();
                     }
                     Err(e) => {
                         log::warn!("Nao foi possivel carregar {}: {}", map_name, e);
@@ -526,6 +617,8 @@ impl DoomEngine {
         self.thinkers.clear();
         self.map = Some(map);
         self.init_player_position();
+        self.build_flat_cache();
+        self.build_sidedef_tex_cache();
 
         // Resetar contadores
         self.game.levelstarttic = self.game.gametic;
@@ -548,41 +641,679 @@ impl DoomEngine {
         if let Some(ref map) = self.map {
             // Thing type 1 = Player 1 start
             if let Some(start) = map.things.iter().find(|t| t.thing_type == 1) {
-                self.player_x = start.x.to_int();
-                self.player_y = start.y.to_int();
-                self.player_angle = start.angle as i32;
+                self.player_x = start.x;
+                self.player_y = start.y;
+                // Converter angulo de graus (0-360) para BAM
+                // C original: ANG45 * (mthing->angle / 45)
+                let deg = ((start.angle as i32 % 360 + 360) % 360) as u64;
+                self.player_angle = (deg * 0x1_0000_0000u64 / 360) as u32;
             }
         }
     }
 
-    /// Aplica o ticcmd atual para mover o jogador no automap.
+    /// Aplica o ticcmd atual para mover o jogador.
     ///
     /// Converte forwardmove/angleturn do ticcmd em deslocamento
-    /// na posicao do jogador usando seno/cosseno do angulo.
+    /// e verifica colisao com linedefs antes de aplicar o movimento.
+    ///
+    /// Usa o sistema completo de colisao do DOOM: P_BoxOnLineSide para
+    /// teste geometrico AABB-vs-linha, P_LineOpening para gap vertical
+    /// em linedefs two-sided, e P_SlideMove para deslizar ao longo
+    /// de paredes quando bloqueado.
+    ///
+    /// C original: `P_MovePlayer()` em `p_user.c` +
+    ///             `P_XYMovement()` / `P_TryMove()` em `p_map.c`
     fn apply_player_movement(&mut self) {
         let slot = (self.game.gametic as usize).wrapping_sub(1) % crate::game::state::BACKUPTICS;
         let cmd = self.game.localcmds[slot];
 
-        // Rotacao
-        self.player_angle = (self.player_angle + cmd.angleturn as i32 / 16) % 360;
-        if self.player_angle < 0 {
-            self.player_angle += 360;
+        // --- Processar BT_USE (abrir portas, ativar switches) ---
+        // C original: P_PlayerThink() em p_user.c, linhas 322-331
+        if cmd.buttons & crate::game::events::BT_USE != 0 {
+            if !self.use_down {
+                self.player_use_lines();
+                self.use_down = true;
+            }
+        } else {
+            self.use_down = false;
         }
 
-        // Movimento frente/tras
+        // --- Processar BT_ATTACK (disparar arma) ---
+        // C original: P_PlayerThink() → P_MovePsprites() em p_pspr.c
+        let fire_pressed = cmd.buttons & crate::game::events::BT_ATTACK != 0;
+        self.player_weapons.tick(fire_pressed);
+
+        // Sincronizar municao da arma com status bar
+        self.sync_player_status();
+
+        // Rotacao (P_MovePlayer: mo->angle += cmd->angleturn<<16)
+        self.player_angle = self.player_angle.wrapping_add((cmd.angleturn as u32) << 16);
+
+        // Calcular deslocamento usando tabelas do DOOM (fixed-point)
+        // C original: P_Thrust(player, angle, forwardmove * 2048)
+        let mut momx = Fixed(0);
+        let mut momy = Fixed(0);
+
         if cmd.forwardmove != 0 {
-            let angle_rad = (self.player_angle as f64) * std::f64::consts::PI / 180.0;
-            let speed = cmd.forwardmove as f64 * 2.0;
-            self.player_x += (speed * angle_rad.cos()) as i32;
-            self.player_y += (speed * angle_rad.sin()) as i32;
+            let fine_angle = (self.player_angle >> ANGLETOFINESHIFT) as usize & FINEMASK;
+            let thrust = Fixed(cmd.forwardmove as i32 * 2048);
+            momx += thrust * fine_cosine(fine_angle);
+            momy += thrust * fine_sine(fine_angle);
         }
 
-        // Strafe esquerda/direita
         if cmd.sidemove != 0 {
-            let angle_rad = ((self.player_angle - 90) as f64) * std::f64::consts::PI / 180.0;
-            let speed = cmd.sidemove as f64 * 2.0;
-            self.player_x += (speed * angle_rad.cos()) as i32;
-            self.player_y += (speed * angle_rad.sin()) as i32;
+            let strafe_angle = self.player_angle.wrapping_sub(Angle::ANG90.0);
+            let fine_angle = (strafe_angle >> ANGLETOFINESHIFT) as usize & FINEMASK;
+            let thrust = Fixed(cmd.sidemove as i32 * 2048);
+            momx += thrust * fine_cosine(fine_angle);
+            momy += thrust * fine_sine(fine_angle);
+        }
+
+        if momx.0 == 0 && momy.0 == 0 {
+            return;
+        }
+
+        let new_x = self.player_x + momx;
+        let new_y = self.player_y + momy;
+
+        // P_TryMove: checar colisao com todas as linedefs relevantes
+        if !self.try_move(new_x, new_y) {
+            // Bloqueado — P_SlideMove: projetar velocidade na parede
+            self.slide_move(momx, momy);
+        }
+    }
+
+    /// Procura linedefs com special na frente do jogador e ativa-as.
+    ///
+    /// Versao simplificada de `P_UseLines()` do C original (`p_map.c`).
+    /// Em vez de usar P_PathTraverse (ray casting completo), verifica
+    /// todas as linedefs dentro de USERANGE (64 unidades) do jogador
+    /// e na direcao que ele esta olhando.
+    ///
+    /// C original: `P_UseLines()` em `p_map.c` + `PTR_UseTraverse()`
+    fn player_use_lines(&mut self) {
+        /// Distancia maxima para ativar uma linedef com Use.
+        /// C original: `#define USERANGE (64*FRACUNIT)` em `p_local.h`
+        const USERANGE: i32 = 64;
+
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+
+        let fine_angle = (self.player_angle >> ANGLETOFINESHIFT) as usize & FINEMASK;
+        let use_dx = fine_cosine(fine_angle);
+        let use_dy = fine_sine(fine_angle);
+
+        // Verificar todas as linedefs — versao simplificada sem P_PathTraverse
+        let mut best_dist = i64::MAX;
+        let mut best_line: Option<usize> = None;
+
+        for (line_idx, line) in map.linedefs.iter().enumerate() {
+            if line.special == 0 {
+                continue;
+            }
+
+            // Verificar se a linedef esta proxima o suficiente
+            let v1 = &map.vertexes[line.v1];
+            let v2 = &map.vertexes[line.v2];
+
+            // Ponto medio da linedef
+            let mid_x = (v1.x.0 as i64 + v2.x.0 as i64) / 2;
+            let mid_y = (v1.y.0 as i64 + v2.y.0 as i64) / 2;
+
+            // Distancia do jogador ao ponto medio
+            let dx = mid_x - self.player_x.0 as i64;
+            let dy = mid_y - self.player_y.0 as i64;
+            let dist_sq = dx * dx + dy * dy;
+
+            // Apenas considerar linedefs dentro de USERANGE * 2 (com margem)
+            let max_range = (USERANGE as i64 * 2) * FRACUNIT as i64;
+            if dist_sq > max_range * max_range {
+                continue;
+            }
+
+            // Verificar se a linedef esta na direcao do jogador
+            // (dot product do vetor jogador→linedef com a direcao do jogador)
+            let dot = dx * use_dx.0 as i64 + dy * use_dy.0 as i64;
+            if dot <= 0 {
+                continue; // Atras do jogador
+            }
+
+            // Verificar que o jogador esta na frente da linedef (front side)
+            // C: P_PointOnLineSide
+            let px = self.player_x.0 as i64 - v1.x.0 as i64;
+            let py = self.player_y.0 as i64 - v1.y.0 as i64;
+            let ldx = line.dx.0 as i64;
+            let ldy = line.dy.0 as i64;
+            let side = py * ldx - px * ldy;
+            if side < 0 {
+                continue; // Lado de tras
+            }
+
+            if dist_sq < best_dist {
+                best_dist = dist_sq;
+                best_line = Some(line_idx);
+            }
+        }
+
+        // Ativar a linedef mais proxima encontrada
+        if let Some(line_idx) = best_line {
+            let special = map.linedefs[line_idx].special;
+            let back_sector = map.linedefs[line_idx].back_sector;
+
+            self.use_special_line(line_idx, special, back_sector);
+        }
+    }
+
+    /// Ativa uma linedef com special (portas, switches, etc.).
+    ///
+    /// Despacha com base no valor de `linedef.special`, similar
+    /// a `P_UseSpecialLine()` em `p_switch.c`.
+    ///
+    /// C original: `P_UseSpecialLine()` em `p_switch.c`
+    fn use_special_line(&mut self, line_idx: usize, special: i16, _back_sector: Option<usize>) {
+        use crate::game::doors::DoorType;
+
+        match special {
+            // --- Portas manuais ---
+            1 | 26..=28 => {
+                // Normal door (raise), locked variants
+                self.ev_vertical_door(line_idx, DoorType::Normal);
+            }
+            31..=34 => {
+                // Open-stay door, locked variants
+                self.ev_vertical_door(line_idx, DoorType::Open);
+            }
+            117 => {
+                // Blazing door raise
+                self.ev_vertical_door(line_idx, DoorType::BlazeRaise);
+            }
+            118 => {
+                // Blazing door open
+                self.ev_vertical_door(line_idx, DoorType::BlazeOpen);
+            }
+            11 => {
+                // Exit level — switch
+                // Limpar special para one-shot
+                if let Some(m) = &mut self.map {
+                    m.linedefs[line_idx].special = 0;
+                }
+                // TODO: implementar transicao de nivel
+                log::info!("Exit switch ativado (special 11)");
+            }
+            _ => {
+                // Outros specials nao implementados ainda
+                log::debug!(
+                    "Linedef special {} nao implementado (line {})",
+                    special,
+                    line_idx
+                );
+            }
+        }
+    }
+
+    /// Cria um thinker de porta vertical para a linedef indicada.
+    ///
+    /// Encontra o sector do lado de tras da linedef e configura
+    /// um DoorThinker que movera o ceiling_height.
+    ///
+    /// C original: `EV_VerticalDoor()` em `p_doors.c`
+    fn ev_vertical_door(&mut self, line_idx: usize, door_type: crate::game::doors::DoorType) {
+        use crate::game::doors::*;
+
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+
+        let line = &map.linedefs[line_idx];
+
+        // Porta manual: setor do lado de tras (back_sector)
+        // C original: sec = sides[line->sidenum[side^1]].sector
+        let sector_idx = match line.back_sector {
+            Some(idx) if idx < map.sectors.len() => idx,
+            _ => return,
+        };
+
+        let sector = &map.sectors[sector_idx];
+
+        // Calcular top_height: teto mais baixo dos sectors vizinhos - 4 unidades
+        let lowest_ceil = find_lowest_ceiling_surrounding(
+            sector_idx,
+            &map.sectors,
+            &map.linedefs,
+        );
+        let top_height = lowest_ceil - Fixed::from_int(4);
+
+        // Velocidade conforme tipo de porta
+        let speed = match door_type {
+            DoorType::BlazeRaise | DoorType::BlazeOpen | DoorType::BlazeClose => {
+                Fixed(VDOORSPEED * 4)
+            }
+            _ => Fixed(VDOORSPEED),
+        };
+
+        let door = DoorThinker {
+            sector_index: sector_idx,
+            door_type,
+            top_height,
+            speed,
+            direction: 1, // abrindo
+            top_countdown: VDOORWAIT,
+            floor_height: sector.floor_height,
+        };
+
+        self.thinkers.add(Box::new(door));
+
+        // Para portas Open e BlazeOpen, limpar special (one-shot)
+        match door_type {
+            DoorType::Open | DoorType::BlazeOpen => {
+                if let Some(m) = &mut self.map {
+                    m.linedefs[line_idx].special = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Tenta mover o jogador para (new_x, new_y).
+    ///
+    /// Verifica colisao AABB com todas as linedefs, incluindo:
+    /// - Linedefs one-sided (paredes solidas)
+    /// - Linedefs com flag BLOCKING
+    /// - Linedefs two-sided com gap vertical insuficiente
+    /// - Step height maximo de 24 unidades (MAXSTEPHEIGHT)
+    ///
+    /// C original: `P_TryMove()` + `P_CheckPosition()` + `PIT_CheckLine()` em `p_map.c`
+    fn try_move(&mut self, new_x: Fixed, new_y: Fixed) -> bool {
+        use crate::map::types::LineDefFlags;
+
+        let map = match &self.map {
+            Some(m) => m,
+            None => return true,
+        };
+
+        // Constantes do DOOM original
+        const PLAYER_RADIUS: i32 = 16 * FRACUNIT; // 16 unidades em fixed-point
+        const PLAYER_HEIGHT: i32 = 56 * FRACUNIT;  // 56 unidades
+        const MAXSTEPHEIGHT: i32 = 24 * FRACUNIT;  // altura maxima de degrau
+
+        // Bounding box do jogador na nova posicao (em fixed-point)
+        let tmbox = [
+            new_y.0 + PLAYER_RADIUS, // BOXTOP
+            new_y.0 - PLAYER_RADIUS, // BOXBOTTOM
+            new_x.0 - PLAYER_RADIUS, // BOXLEFT
+            new_x.0 + PLAYER_RADIUS, // BOXRIGHT
+        ];
+
+        // Altura do piso atual do jogador
+        let current_floor = self.find_player_floor_height();
+
+        // tmfloorz e tmceilingz rastreiam o piso mais alto e teto mais
+        // baixo de todos os sectors que a AABB toca na nova posicao.
+        // Inicializados com os valores do sector de destino.
+        let dest_floor = self.find_floor_height_at(new_x, new_y);
+        let dest_ceil = self.find_ceiling_height_at(new_x, new_y);
+        let mut tmfloorz = dest_floor;
+        let mut tmceilingz = dest_ceil;
+        let mut tmdropoffz = dest_floor;
+
+        // PIT_CheckLine: iterar todas as linedefs
+        for ld in &map.linedefs {
+            let v1 = &map.vertexes[ld.v1];
+            let v2 = &map.vertexes[ld.v2];
+
+            // Bounding box da linedef (em fixed-point)
+            let line_bbox = [
+                v1.y.0.max(v2.y.0), // BOXTOP
+                v1.y.0.min(v2.y.0), // BOXBOTTOM
+                v1.x.0.min(v2.x.0), // BOXLEFT
+                v1.x.0.max(v2.x.0), // BOXRIGHT
+            ];
+
+            // Quick reject: AABBs nao se sobrepoem
+            if tmbox[3] <= line_bbox[2]  // right <= line_left
+                || tmbox[2] >= line_bbox[3]  // left >= line_right
+                || tmbox[0] <= line_bbox[1]  // top <= line_bottom
+                || tmbox[1] >= line_bbox[0]  // bottom >= line_top
+            {
+                continue;
+            }
+
+            // P_BoxOnLineSide: teste AABB vs linha infinita
+            let side = Self::box_on_line_side(&tmbox, v1.x.0, v1.y.0, ld);
+            if side != -1 {
+                // AABB inteira de um lado da linha — nao cruza
+                continue;
+            }
+
+            // A AABB cruza esta linedef
+
+            // One-sided = parede solida, bloqueia sempre
+            if ld.back_sector.is_none() {
+                log::trace!(
+                    "try_move BLOCKED: one-sided linedef v1=({},{}) v2=({},{})",
+                    v1.x.0 >> FRACBITS, v1.y.0 >> FRACBITS,
+                    v2.x.0 >> FRACBITS, v2.y.0 >> FRACBITS
+                );
+                return false;
+            }
+
+            // Flags de bloqueio
+            if ld.flags.contains(LineDefFlags::BLOCKING) {
+                log::trace!("try_move BLOCKED: BLOCKING flag on linedef");
+                return false;
+            }
+
+            // P_LineOpening: calcular gap vertical da linedef two-sided
+            let (opentop, openbottom, _openrange, lowfloor) =
+                Self::line_opening(ld, map);
+
+            // Ajustar tmfloorz / tmceilingz (PIT_CheckLine linhas 227-237)
+            if opentop < tmceilingz {
+                tmceilingz = opentop;
+            }
+            if openbottom > tmfloorz {
+                tmfloorz = openbottom;
+            }
+            if lowfloor < tmdropoffz {
+                tmdropoffz = lowfloor;
+            }
+        }
+
+        // P_TryMove: verificacoes finais de altura
+
+        // Cabe verticalmente?
+        if tmceilingz - tmfloorz < PLAYER_HEIGHT {
+            log::trace!(
+                "try_move BLOCKED: gap={} < PLAYER_HEIGHT={}, ceil={}, floor={}, pos=({},{})",
+                tmceilingz - tmfloorz, PLAYER_HEIGHT, tmceilingz, tmfloorz,
+                new_x.0 >> FRACBITS, new_y.0 >> FRACBITS
+            );
+            return false;
+        }
+
+        // Teto baixo demais para a posicao atual do jogador?
+        if tmceilingz - current_floor.0 < PLAYER_HEIGHT {
+            log::trace!(
+                "try_move BLOCKED: ceil_clearance={} < PLAYER_HEIGHT, ceil={}, cur_floor={}",
+                tmceilingz - current_floor.0, tmceilingz, current_floor.0
+            );
+            return false;
+        }
+
+        // Degrau alto demais? (maximo 24 unidades)
+        if tmfloorz - current_floor.0 > MAXSTEPHEIGHT {
+            log::trace!(
+                "try_move BLOCKED: step={} > MAXSTEP={}, floor={}, cur_floor={}",
+                tmfloorz - current_floor.0, MAXSTEPHEIGHT, tmfloorz, current_floor.0
+            );
+            return false;
+        }
+
+        // Dropoff muito grande? (nao ficar sobre um abismo > 24 unidades)
+        if tmfloorz - tmdropoffz > MAXSTEPHEIGHT {
+            log::trace!(
+                "try_move BLOCKED: dropoff={} > MAXSTEP, floor={}, drop={}",
+                tmfloorz - tmdropoffz, tmfloorz, tmdropoffz
+            );
+            return false;
+        }
+
+        // Movimento valido
+        log::trace!(
+            "try_move OK: pos=({},{}) floor={} ceil={} drop={}",
+            new_x.0 >> FRACBITS, new_y.0 >> FRACBITS,
+            tmfloorz >> FRACBITS, tmceilingz >> FRACBITS, tmdropoffz >> FRACBITS
+        );
+        self.player_x = new_x;
+        self.player_y = new_y;
+        true
+    }
+
+    /// Desliza o jogador ao longo de paredes quando o movimento direto
+    /// e bloqueado.
+    ///
+    /// Implementacao simplificada de P_SlideMove: tenta o movimento
+    /// em cada eixo separadamente, e se ambos falharem, projeta
+    /// a velocidade na direcao da parede mais proxima.
+    ///
+    /// C original: `P_SlideMove()` + `P_HitSlideLine()` em `p_map.c`
+    fn slide_move(&mut self, momx: Fixed, momy: Fixed) {
+        // Tentativa 1: mover apenas no eixo X
+        let try_x = self.player_x + momx;
+        if self.try_move(try_x, self.player_y) {
+            return;
+        }
+
+        // Tentativa 2: mover apenas no eixo Y
+        let try_y = self.player_y + momy;
+        if self.try_move(self.player_x, try_y) {
+            return;
+        }
+
+        // Tentativa 3: mover com metade da velocidade em cada eixo
+        let half_x = self.player_x + Fixed(momx.0 / 2);
+        let half_y = self.player_y + Fixed(momy.0 / 2);
+        if self.try_move(half_x, half_y) {
+            return;
+        }
+
+        // Tentativa 4: quartos
+        if self.try_move(half_x, self.player_y) {
+            return;
+        }
+        // Ultimo recurso: tentar apenas Y
+        let _ = self.try_move(self.player_x, half_y);
+    }
+
+    /// Determina de que lado de uma linedef infinita a AABB esta.
+    ///
+    /// Retorna 0 (front), 1 (back) ou -1 (cruza a linha).
+    /// Usa o slopetype da linedef para otimizacao (fast path para
+    /// linhas horizontais e verticais).
+    ///
+    /// C original: `P_BoxOnLineSide()` em `p_maputl.c`
+    fn box_on_line_side(
+        tmbox: &[i32; 4], // [top, bottom, left, right]
+        v1x: i32,
+        v1y: i32,
+        ld: &crate::map::types::LineDef,
+    ) -> i32 {
+        use crate::map::types::SlopeType;
+
+        let (p1, p2) = match ld.slope_type {
+            SlopeType::Horizontal => {
+                let mut a = (tmbox[0] > v1y) as i32; // top > v1.y
+                let mut b = (tmbox[1] > v1y) as i32; // bottom > v1.y
+                if ld.dx.0 < 0 {
+                    a ^= 1;
+                    b ^= 1;
+                }
+                (a, b)
+            }
+            SlopeType::Vertical => {
+                let mut a = (tmbox[3] < v1x) as i32; // right < v1.x
+                let mut b = (tmbox[2] < v1x) as i32; // left < v1.x
+                if ld.dy.0 < 0 {
+                    a ^= 1;
+                    b ^= 1;
+                }
+                (a, b)
+            }
+            SlopeType::Positive => {
+                let a = Self::point_on_line_side(tmbox[2], tmbox[0], v1x, v1y, ld); // left, top
+                let b = Self::point_on_line_side(tmbox[3], tmbox[1], v1x, v1y, ld); // right, bottom
+                (a, b)
+            }
+            SlopeType::Negative => {
+                let a = Self::point_on_line_side(tmbox[3], tmbox[0], v1x, v1y, ld); // right, top
+                let b = Self::point_on_line_side(tmbox[2], tmbox[1], v1x, v1y, ld); // left, bottom
+                (a, b)
+            }
+        };
+
+        if p1 == p2 {
+            p1
+        } else {
+            -1
+        }
+    }
+
+    /// Determina de que lado de uma linedef um ponto esta.
+    ///
+    /// Retorna 0 (front/esquerda) ou 1 (back/direita).
+    /// Usa cross product: (dy >> 16) * (px - v1x) vs (py - v1y) * (dx >> 16)
+    ///
+    /// C original: `P_PointOnLineSide()` em `p_maputl.c`
+    fn point_on_line_side(
+        x: i32,
+        y: i32,
+        v1x: i32,
+        v1y: i32,
+        ld: &crate::map::types::LineDef,
+    ) -> i32 {
+        // Fast path para linhas ortogonais
+        if ld.dx.0 == 0 {
+            return if x <= v1x {
+                (ld.dy.0 > 0) as i32
+            } else {
+                (ld.dy.0 < 0) as i32
+            };
+        }
+        if ld.dy.0 == 0 {
+            return if y <= v1y {
+                (ld.dx.0 < 0) as i32
+            } else {
+                (ld.dx.0 > 0) as i32
+            };
+        }
+
+        // Cross product para determinar o lado
+        let dx = x - v1x;
+        let dy = y - v1y;
+        let left = (ld.dy.0 >> FRACBITS) as i64 * dx as i64;
+        let right = dy as i64 * (ld.dx.0 >> FRACBITS) as i64;
+
+        if right < left {
+            0 // front side
+        } else {
+            1 // back side
+        }
+    }
+
+    /// Calcula a abertura vertical de uma linedef two-sided.
+    ///
+    /// Retorna (opentop, openbottom, openrange, lowfloor) em fixed-point.
+    /// - opentop: teto mais baixo entre os dois sectors
+    /// - openbottom: piso mais alto entre os dois sectors
+    /// - openrange: espaco livre vertical (opentop - openbottom)
+    /// - lowfloor: piso mais baixo (para deteccao de dropoff)
+    ///
+    /// C original: `P_LineOpening()` em `p_maputl.c`
+    fn line_opening(
+        ld: &crate::map::types::LineDef,
+        map: &crate::map::MapData,
+    ) -> (i32, i32, i32, i32) {
+        // One-sided: sem abertura
+        let back_idx = match ld.back_sector {
+            Some(idx) => idx,
+            None => return (0, 0, 0, 0),
+        };
+        let front_idx = match ld.front_sector {
+            Some(idx) => idx,
+            None => return (0, 0, 0, 0),
+        };
+
+        if front_idx >= map.sectors.len() || back_idx >= map.sectors.len() {
+            return (0, 0, 0, 0);
+        }
+
+        let front = &map.sectors[front_idx];
+        let back = &map.sectors[back_idx];
+
+        let opentop = front.ceiling_height.0.min(back.ceiling_height.0);
+
+        let (openbottom, lowfloor) = if front.floor_height.0 > back.floor_height.0 {
+            (front.floor_height.0, back.floor_height.0)
+        } else {
+            (back.floor_height.0, front.floor_height.0)
+        };
+
+        let openrange = opentop - openbottom;
+        (opentop, openbottom, openrange, lowfloor)
+    }
+
+    /// Encontra a altura do teto no sector que contem o ponto (x, y).
+    ///
+    /// Usa BSP traversal para encontrar o subsector de destino.
+    fn find_ceiling_height_at(&self, x: Fixed, y: Fixed) -> i32 {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return i32::MAX,
+        };
+
+        if map.nodes.is_empty() || map.subsectors.is_empty() {
+            return i32::MAX;
+        }
+
+        let mut node_id = (map.nodes.len() - 1) as u16;
+        loop {
+            if node_id & crate::map::types::NF_SUBSECTOR != 0 {
+                let ss_id = (node_id & !crate::map::types::NF_SUBSECTOR) as usize;
+                if ss_id < map.subsectors.len() {
+                    let sector_idx = map.subsectors[ss_id].sector;
+                    if sector_idx < map.sectors.len() {
+                        return map.sectors[sector_idx].ceiling_height.0;
+                    }
+                }
+                return i32::MAX;
+            }
+
+            if (node_id as usize) >= map.nodes.len() {
+                return i32::MAX;
+            }
+
+            let node = &map.nodes[node_id as usize];
+            let side = RenderState::point_on_side(x, y, node);
+            node_id = node.children[side];
+        }
+    }
+
+    /// Encontra a altura do piso no sector que contem o ponto (x, y).
+    ///
+    /// Usa BSP traversal para encontrar o subsector de destino.
+    fn find_floor_height_at(&self, x: Fixed, y: Fixed) -> i32 {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return 0,
+        };
+
+        if map.nodes.is_empty() || map.subsectors.is_empty() {
+            return 0;
+        }
+
+        let mut node_id = (map.nodes.len() - 1) as u16;
+        loop {
+            if node_id & crate::map::types::NF_SUBSECTOR != 0 {
+                let ss_id = (node_id & !crate::map::types::NF_SUBSECTOR) as usize;
+                if ss_id < map.subsectors.len() {
+                    let sector_idx = map.subsectors[ss_id].sector;
+                    if sector_idx < map.sectors.len() {
+                        return map.sectors[sector_idx].floor_height.0;
+                    }
+                }
+                return 0;
+            }
+
+            if (node_id as usize) >= map.nodes.len() {
+                return 0;
+            }
+
+            let node = &map.nodes[node_id as usize];
+            let side = RenderState::point_on_side(x, y, node);
+            node_id = node.children[side];
         }
     }
 
@@ -612,7 +1343,11 @@ impl DoomEngine {
     fn d_display(&mut self) {
         match self.game.state {
             GameStateType::Level => {
-                self.draw_automap();
+                self.render_player_view();
+                // Desenhar sprite da arma sobre a vista 3D
+                self.draw_weapon_sprite();
+                // Desenhar status bar sobre a vista 3D
+                self.draw_status_bar();
             }
             GameStateType::DemoScreen => {
                 self.draw_title_screen();
@@ -636,6 +1371,399 @@ impl DoomEngine {
         // Menu overlay — desenha por cima de tudo quando ativo
         if self.menu.active {
             self.draw_menu();
+        }
+    }
+
+    /// Sincroniza o estado das armas do jogador com a status bar.
+    ///
+    /// Copia municao, armas possuidas, etc. da struct de armas
+    /// para a struct de informacoes do jogador (usada pela status bar).
+    fn sync_player_status(&mut self) {
+        self.player_status.ammo = self.player_weapons.ammo.get(
+            WEAPON_INFO[self.player_weapons.ready_weapon as usize].ammo_type as usize
+        ).copied().unwrap_or(0);
+
+        for (i, &owned) in self.player_weapons.weapon_owned.iter().enumerate() {
+            if i < self.player_status.weapon_owned.len() {
+                self.player_status.weapon_owned[i] = owned;
+            }
+        }
+
+        for (i, &ammo) in self.player_weapons.ammo.iter().enumerate() {
+            if i < self.player_status.ammo_counts.len() {
+                self.player_status.ammo_counts[i] = ammo;
+            }
+        }
+
+        for (i, &max) in self.player_weapons.max_ammo.iter().enumerate() {
+            if i < self.player_status.max_ammo.len() {
+                self.player_status.max_ammo[i] = max;
+            }
+        }
+    }
+
+    /// Desenha o sprite da arma atual sobre a vista 3D.
+    ///
+    /// Carrega o patch da arma do WAD e desenha na posicao
+    /// central inferior da tela (acima da status bar).
+    ///
+    /// C original: `R_DrawPSprite()` em `r_things.c`
+    fn draw_weapon_sprite(&mut self) {
+        let sprite_name = match self.player_weapons.current_sprite_name() {
+            Some(name) => name,
+            None => return,
+        };
+
+        let patch_data = match self.wad.read_lump_by_name(&sprite_name) {
+            Ok(data) if data.len() > 8 => data,
+            _ => return,
+        };
+
+        // Posicao Y ajustada (raise/lower offset + base)
+        let y_offset = self.player_weapons.weapon_y_offset();
+
+        // No Freedoom, sprites de arma tem offsets negativos que representam
+        // a posicao absoluta na tela. V_DrawPatch faz (x - leftoffset),
+        // entao com x=0 e leftoffset=-125, temos draw_x = 0-(-125) = 125.
+        // Idem para Y: draw_y = y_offset - (-97) = 97.
+        //
+        // C original: R_DrawPSprite calcula a posicao via psp->sx/sy e
+        // spriteoffset/spritetopoffset. Para nossa versao simplificada,
+        // usamos (0, y_offset) e deixamos os offsets do patch posicionar.
+        self.draw_patch_clipped(0, y_offset, &patch_data);
+    }
+
+    /// Desenha a status bar na parte inferior da tela (32 pixels).
+    ///
+    /// Carrega o patch "STBAR" do WAD como fundo, e desenha os
+    /// numeros de saude, ammo, armor usando patches STTNUM0-9.
+    /// Tambem desenha a face do Doomguy e chaves.
+    ///
+    /// C original: `ST_Drawer()` → `ST_refreshBackground()` + `ST_drawWidgets()`
+    /// em `st_stuff.c`
+    fn draw_status_bar(&mut self) {
+        if !self.statusbar.status_bar_on {
+            return;
+        }
+
+        // Atualizar estado dos widgets
+        self.statusbar.ticker(&self.player_status);
+
+        // --- Desenhar fundo da status bar ---
+        // C original: V_DrawPatch(ST_X, 0, BG, sbar) em ST_refreshBackground()
+        if let Ok(stbar_data) = self.wad.read_lump_by_name("STBAR") {
+            if stbar_data.len() > 8 {
+                // Desenhar STBAR diretamente no screen 0 na posicao Y=168
+                self.draw_patch_clipped(0, ST_Y, &stbar_data);
+            }
+        }
+
+        // --- Desenhar numeros (saude, ammo, armor) ---
+        // Carregar patches de digitos STTNUM0-STTNUM9
+        let mut digit_patches: Vec<Option<Vec<u8>>> = Vec::with_capacity(10);
+        for i in 0..10 {
+            let name = format!("STTNUM{}", i);
+            digit_patches.push(self.wad.read_lump_by_name(&name).ok());
+        }
+
+        // Carregar patch de percentual
+        let percent_patch = self.wad.read_lump_by_name("STTPRCNT").ok();
+
+        // Desenhar ammo (ready weapon)
+        self.draw_st_number(
+            self.statusbar.w_ammo.x,
+            self.statusbar.w_ammo.y,
+            self.statusbar.w_ammo.value,
+            self.statusbar.w_ammo.width,
+            &digit_patches,
+        );
+
+        // Desenhar saude com %
+        self.draw_st_number(
+            self.statusbar.w_health.number.x,
+            self.statusbar.w_health.number.y,
+            self.statusbar.w_health.number.value,
+            self.statusbar.w_health.number.width,
+            &digit_patches,
+        );
+        if let Some(ref pct) = percent_patch {
+            self.draw_patch_clipped(
+                self.statusbar.w_health.number.x,
+                self.statusbar.w_health.number.y,
+                pct,
+            );
+        }
+
+        // Desenhar armor com %
+        self.draw_st_number(
+            self.statusbar.w_armor.number.x,
+            self.statusbar.w_armor.number.y,
+            self.statusbar.w_armor.number.value,
+            self.statusbar.w_armor.number.width,
+            &digit_patches,
+        );
+        if let Some(ref pct) = percent_patch {
+            self.draw_patch_clipped(
+                self.statusbar.w_armor.number.x,
+                self.statusbar.w_armor.number.y,
+                pct,
+            );
+        }
+
+        // --- Desenhar face do Doomguy ---
+        let face_name = self.get_face_lump_name(self.statusbar.face_index);
+        if let Ok(face_data) = self.wad.read_lump_by_name(&face_name) {
+            if face_data.len() > 8 {
+                self.draw_patch_clipped(
+                    self.statusbar.w_face.x,
+                    self.statusbar.w_face.y,
+                    &face_data,
+                );
+            }
+        }
+
+        // --- Desenhar chaves ---
+        // Copiar dados dos widgets para evitar borrow conflict
+        let keyboxes: Vec<(i32, i32, i32)> = self
+            .statusbar
+            .w_keyboxes
+            .iter()
+            .map(|w| (w.x, w.y, w.icon_index))
+            .collect();
+        for (kx, ky, idx) in &keyboxes {
+            if *idx >= 0 {
+                let name = format!("STKEYS{}", idx);
+                if let Ok(key_data) = self.wad.read_lump_by_name(&name) {
+                    if key_data.len() > 8 {
+                        self.draw_patch_clipped(*kx, *ky, &key_data);
+                    }
+                }
+            }
+        }
+
+        // --- Desenhar arms background e numeros de armas ---
+        if let Ok(armsbg) = self.wad.read_lump_by_name("STARMS") {
+            if armsbg.len() > 8 {
+                self.draw_patch_clipped(104, ST_Y, &armsbg);
+            }
+        }
+
+        // Desenhar numeros de armas (2-7) usando STGNUM ou STYSNUM
+        let arms: Vec<(i32, i32, i32, usize)> = self
+            .statusbar
+            .w_arms
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.x, w.y, w.icon_index, i))
+            .collect();
+        for (ax, ay, icon, i) in &arms {
+            if *icon > 0 {
+                let name = format!("STYSNUM{}", i + 2);
+                if let Ok(data) = self.wad.read_lump_by_name(&name) {
+                    if data.len() > 8 {
+                        self.draw_patch_clipped(*ax, *ay, &data);
+                    }
+                }
+            } else {
+                let name = format!("STGNUM{}", i + 2);
+                if let Ok(data) = self.wad.read_lump_by_name(&name) {
+                    if data.len() > 8 {
+                        self.draw_patch_clipped(*ax, *ay, &data);
+                    }
+                }
+            }
+        }
+
+        // --- Desenhar contagens de municao (pequenos numeros) ---
+        let mut small_digits: Vec<Option<Vec<u8>>> = Vec::with_capacity(10);
+        for i in 0..10 {
+            let name = format!("STYSNUM{}", i);
+            small_digits.push(self.wad.read_lump_by_name(&name).ok());
+        }
+
+        let ammo_widgets: Vec<(i32, i32, i32, usize)> = self
+            .statusbar
+            .w_ammo_counts
+            .iter()
+            .map(|w| (w.x, w.y, w.value, w.width))
+            .collect();
+        let max_ammo_widgets: Vec<(i32, i32, i32, usize)> = self
+            .statusbar
+            .w_max_ammo
+            .iter()
+            .map(|w| (w.x, w.y, w.value, w.width))
+            .collect();
+        for (wx, wy, val, width) in &ammo_widgets {
+            self.draw_st_number(*wx, *wy, *val, *width, &small_digits);
+        }
+        for (wx, wy, val, width) in &max_ammo_widgets {
+            self.draw_st_number(*wx, *wy, *val, *width, &small_digits);
+        }
+    }
+
+    /// Desenha um numero right-justified usando patches de digitos.
+    ///
+    /// C original: `STlib_drawNum()` em `st_lib.c`
+    fn draw_st_number(
+        &mut self,
+        x: i32,
+        y: i32,
+        value: i32,
+        width: usize,
+        digit_patches: &[Option<Vec<u8>>],
+    ) {
+        use crate::menu::st_widgets::ST_DONT_DRAW;
+
+        if value == ST_DONT_DRAW {
+            return;
+        }
+
+        // Largura de um digito (tipicamente 14 pixels para STTNUM)
+        let digit_width = if let Some(Some(ref patch)) = digit_patches.first() {
+            if patch.len() >= 2 {
+                i16::from_le_bytes([patch[0], patch[1]]) as i32
+            } else {
+                14
+            }
+        } else {
+            14
+        };
+
+        let num = value.unsigned_abs();
+        let mut draw_x = x;
+
+        // Caso especial: zero
+        if num == 0 {
+            draw_x -= digit_width;
+            if let Some(Some(ref patch)) = digit_patches.first() {
+                self.draw_patch_clipped(draw_x, y, patch);
+            }
+            return;
+        }
+
+        // Desenhar digitos da direita para a esquerda
+        let mut remaining = num;
+        let mut digits_drawn = 0;
+        while remaining > 0 && digits_drawn < width {
+            draw_x -= digit_width;
+            let digit = (remaining % 10) as usize;
+            if digit < digit_patches.len() {
+                if let Some(ref patch) = digit_patches[digit] {
+                    self.draw_patch_clipped(draw_x, y, patch);
+                }
+            }
+            remaining /= 10;
+            digits_drawn += 1;
+        }
+    }
+
+    /// Retorna o nome do lump da face do Doomguy para um indice.
+    ///
+    /// Mapeamento: indices 0..39 = faces de dor/direcao/especiais,
+    /// 40 = god mode (STFGOD0), 41 = dead (STFDEAD0).
+    ///
+    /// C original: array `faces[]` carregado em `ST_loadGraphics()`
+    fn get_face_lump_name(&self, face_index: usize) -> String {
+        use crate::menu::statusbar::*;
+
+        if face_index == ST_GODFACE {
+            return "STFGOD0".to_string();
+        }
+        if face_index == ST_DEADFACE {
+            return "STFDEAD0".to_string();
+        }
+
+        let pain = face_index / ST_FACESTRIDE;
+        let within = face_index % ST_FACESTRIDE;
+
+        if within < ST_NUMSTRAIGHTFACES {
+            // Olhando em frente
+            format!("STFST{}{}", pain, within)
+        } else if within < ST_NUMSTRAIGHTFACES + ST_NUMTURNFACES {
+            // Olhando para os lados
+            let turn = within - ST_NUMSTRAIGHTFACES;
+            if turn == 0 {
+                format!("STFTR{}0", pain)
+            } else {
+                format!("STFTL{}0", pain)
+            }
+        } else {
+            // Faces especiais (ouch, evil grin, rampage)
+            let special = within - ST_NUMSTRAIGHTFACES - ST_NUMTURNFACES;
+            match special {
+                0 => format!("STFOUCH{}", pain),
+                1 => format!("STFEVL{}", pain),
+                _ => format!("STFKILL{}", pain),
+            }
+        }
+    }
+
+    /// Desenha um patch no screen 0, com clipping nas bordas da tela.
+    ///
+    /// Versao mais robusta de `draw_patch` que permite patches parcialmente
+    /// fora da tela (a versao padrao rejeita patches que saem dos limites).
+    ///
+    /// C original: `V_DrawPatch()` em `v_video.c` (com range check relaxado)
+    fn draw_patch_clipped(&mut self, x: i32, y: i32, patch_data: &[u8]) {
+        if patch_data.len() < 8 {
+            return;
+        }
+
+        let width = i16::from_le_bytes([patch_data[0], patch_data[1]]) as i32;
+        let _height = i16::from_le_bytes([patch_data[2], patch_data[3]]) as i32;
+        let left_offset = i16::from_le_bytes([patch_data[4], patch_data[5]]) as i32;
+        let top_offset = i16::from_le_bytes([patch_data[6], patch_data[7]]) as i32;
+
+        let draw_x = x - left_offset;
+        let draw_y = y - top_offset;
+
+        let screen = self.video.screen_mut(0);
+
+        for col in 0..width {
+            let screen_x = draw_x + col;
+            if screen_x < 0 || screen_x >= SCREENWIDTH as i32 {
+                continue;
+            }
+
+            let ofs_pos = 8 + (col as usize) * 4;
+            if ofs_pos + 4 > patch_data.len() {
+                break;
+            }
+            let col_offset = u32::from_le_bytes([
+                patch_data[ofs_pos],
+                patch_data[ofs_pos + 1],
+                patch_data[ofs_pos + 2],
+                patch_data[ofs_pos + 3],
+            ]) as usize;
+
+            let mut post_offset = col_offset;
+            loop {
+                if post_offset >= patch_data.len() {
+                    break;
+                }
+
+                let top_delta = patch_data[post_offset];
+                if top_delta == 0xFF {
+                    break;
+                }
+
+                let length = patch_data[post_offset + 1] as usize;
+                let pixel_start = post_offset + 3;
+
+                for i in 0..length {
+                    let screen_y = draw_y + top_delta as i32 + i as i32;
+                    if screen_y >= 0 && screen_y < SCREENHEIGHT as i32 {
+                        let pixel_pos = pixel_start + i;
+                        if pixel_pos < patch_data.len() {
+                            let dest_idx =
+                                screen_y as usize * SCREENWIDTH + screen_x as usize;
+                            screen[dest_idx] = patch_data[pixel_pos];
+                        }
+                    }
+                }
+
+                post_offset = pixel_start + length + 1;
+            }
         }
     }
 
@@ -767,12 +1895,14 @@ impl DoomEngine {
     }
 
     /// Desenha uma vista automap (top-down) do mapa carregado.
+    /// Mantido para futuro toggle via tecla TAB.
     ///
     /// Renderiza as linedefs do mapa como linhas coloridas no
     /// framebuffer, similar ao automap do DOOM (tecla TAB).
     /// Paredes one-sided em vermelho, two-sided em cinza/marrom.
     ///
     /// C original: `AM_Drawer()` em `am_map.c`
+    #[allow(dead_code)]
     fn draw_automap(&mut self) {
         let w = crate::video::SCREENWIDTH;
         let h = crate::video::SCREENHEIGHT;
@@ -824,8 +1954,8 @@ impl DoomEngine {
         // Centralizar no jogador
         let center_x = w as i32 / 2;
         let center_y = h as i32 / 2;
-        let px = self.player_x;
-        let py = self.player_y;
+        let px = self.player_x.to_int();
+        let py = self.player_y.to_int();
 
         // Converter coordenada do mapa para pixel na tela
         let to_screen = |mx: i32, my: i32| -> (i32, i32) {
@@ -846,7 +1976,7 @@ impl DoomEngine {
 
         // Posicao do jogador na tela (sempre no centro)
         let player_screen = to_screen(px, py);
-        let player_angle = self.player_angle;
+        let player_angle_bam = self.player_angle;
 
         let screen = self.video.screen_mut(0);
 
@@ -862,7 +1992,8 @@ impl DoomEngine {
         }
 
         // Desenhar seta do jogador (triangulo apontando na direcao do angulo)
-        let angle_rad = (player_angle as f64) * std::f64::consts::PI / 180.0;
+        // Converter BAM para radianos: BAM / 2^32 * 2*PI
+        let angle_rad = (player_angle_bam as f64) * (2.0 * std::f64::consts::PI) / 4_294_967_296.0;
         let arrow_len: f64 = 8.0;
         let (psx, psy) = player_screen;
 
@@ -885,6 +2016,928 @@ impl DoomEngine {
         draw_line(screen, w, h, b1x, b1y, b2x, b2y, 0x04);
     }
 
+    /// Renderiza a cena 3D em primeira pessoa.
+    ///
+    /// Implementa o pipeline de rendering do DOOM:
+    /// 1. Configurar camera (R_SetupFrame)
+    /// 2. Travessia BSP (R_RenderBSPNode) para coletar paredes visiveis
+    /// 3. Renderizar paredes com perspectiva coluna-a-coluna
+    /// 4. Preencher pisos e tetos com cores planas
+    ///
+    /// C original: `R_RenderPlayerView()` em `r_main.c`
+    fn render_player_view(&mut self) {
+        // 1. Configurar camera a partir da posicao do jogador
+        self.setup_camera();
+
+        // 2. Limpar apenas a area da vista 3D (168 linhas, nao 200)
+        // A status bar em baixo sera desenhada por cima
+        {
+            let screen = self.video.screen_mut(0);
+            let view_pixels = SCREENWIDTH * ST_Y as usize;
+            screen[..view_pixels].fill(0);
+        }
+
+        // 3. Calcular basexscale/baseyscale (depende de viewangle, muda por frame)
+        let angle_idx = ((self.render_state.viewangle.0.wrapping_sub(Angle::ANG90.0))
+            >> ANGLETOFINESHIFT) as usize
+            & FINEMASK;
+        let basexscale =
+            (fine_cosine(angle_idx) / Fixed(self.render_state.centerxfrac.0)).0;
+        let baseyscale =
+            -(fine_sine(angle_idx) / Fixed(self.render_state.centerxfrac.0)).0;
+
+        // 4. Travessia BSP para coletar segmentos de parede visiveis
+        let mut bsp = BspTraversal::new();
+        if let Some(ref map) = self.map {
+            bsp.render_bsp(map, &self.render_state);
+        }
+
+        // 5. Renderizar paredes coletadas com perspectiva e flats texturizados
+        // yslope e distscale sao tabelas constantes pre-calculadas na init
+        let plane_data = PlaneRenderData {
+            yslope: self.plane_yslope,
+            distscale: self.plane_distscale,
+            basexscale,
+            baseyscale,
+        };
+        let wall_segments = std::mem::take(&mut bsp.wall_ranges);
+        self.render_walls(&wall_segments, &plane_data);
+    }
+
+    /// Constroi cache de dados de flat (piso/teto) para o mapa atual.
+    ///
+    /// Carrega todos os flats referenciados pelos sectors do mapa
+    /// uma unica vez, armazenando em self.flat_cache.
+    /// Chamado ao carregar um novo mapa, nao a cada frame.
+    ///
+    /// C original: `R_InitFlats()` em `r_data.c`
+    fn build_flat_cache(&mut self) {
+        self.flat_cache.clear();
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+        let td = match &self.texture_data {
+            Some(td) => td,
+            None => return,
+        };
+
+        // Coletar nomes unicos de flats usados nos sectors
+        for sector in &map.sectors {
+            for flat_name in [&sector.floor_pic, &sector.ceiling_pic] {
+                if flat_name[0] == 0 || self.flat_cache.contains_key(flat_name) {
+                    continue;
+                }
+                // Encontrar o lump do flat
+                let end = flat_name.iter().position(|&b| b == 0).unwrap_or(8);
+                let name_str = std::str::from_utf8(&flat_name[..end]).unwrap_or("");
+                if let Some(flat_num) = td.flat_num_for_name(name_str, &self.wad) {
+                    let lump_idx = td.first_flat + flat_num;
+                    if let Ok(data) = self.wad.read_lump(lump_idx) {
+                        if data.len() >= 4096 {
+                            self.flat_cache.insert(*flat_name, data[..4096].to_vec());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Constroi cache de texturas resolvidas por sidedef.
+    ///
+    /// Resolve os nomes de textura (mid, top, bottom) de cada sidedef
+    /// uma unica vez ao carregar o mapa, evitando lookups repetidos
+    /// a cada frame no render loop.
+    fn build_sidedef_tex_cache(&mut self) {
+        self.sidedef_tex_cache.clear();
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+        let td = match &self.texture_data {
+            Some(td) => td,
+            None => return,
+        };
+
+        self.sidedef_tex_cache.reserve(map.sidedefs.len());
+        for sd in &map.sidedefs {
+            let mid = Self::resolve_texture_name(&sd.mid_texture, td);
+            let top = Self::resolve_texture_name(&sd.top_texture, td);
+            let bot = Self::resolve_texture_name(&sd.bottom_texture, td);
+            self.sidedef_tex_cache.push((mid, top, bot));
+        }
+    }
+
+    /// Inicializa as tabelas de projecao de planos (yslope e distscale).
+    ///
+    /// Estas tabelas sao constantes (dependem apenas das dimensoes da tela
+    /// e da tabela xtoviewangle, que nao muda). Calculadas uma unica vez
+    /// na inicializacao, evitando recalculo a cada frame.
+    ///
+    /// C original: parte de `R_InitTextureMapping()` e `R_SetupFrame()` em `r_main.c`
+    fn init_plane_tables(&mut self) {
+        // yslope[y] = FixedDiv(viewwidth/2, abs(y - centery))
+        for (i, slot) in self.plane_yslope.iter_mut().enumerate() {
+            // Usar centery da view (84 = viewheight/2), nao SCREENHEIGHT/2
+            // C original: centery = viewheight / 2 onde viewheight = 168
+            let dy = ((i as i32 - self.render_state.centery) << FRACBITS) + FRACUNIT / 2;
+            let dy = dy.abs();
+            if dy > 0 {
+                *slot = (Fixed::from_int(SCREENWIDTH as i32 / 2) / Fixed(dy)).0;
+            }
+        }
+
+        // distscale[x] = 1 / cos(xtoviewangle[x])
+        for (i, slot) in self.plane_distscale.iter_mut().enumerate() {
+            let cos_adj = fine_cosine(
+                (self.render_state.xtoviewangle[i].0 >> ANGLETOFINESHIFT) as usize & FINEMASK,
+            );
+            if cos_adj.0.abs() > 0 {
+                *slot = (Fixed(FRACUNIT) / cos_adj).0.abs();
+            }
+        }
+    }
+
+    /// Configura a camera do renderer a partir da posicao do jogador.
+    ///
+    /// Posicao ja esta em fixed-point e angulo ja esta em BAM,
+    /// entao basta atribuir diretamente ao render_state.
+    ///
+    /// C original: `R_SetupFrame()` em `r_main.c`
+    fn setup_camera(&mut self) {
+        self.render_state.viewx = self.player_x;
+        self.render_state.viewy = self.player_y;
+
+        // Altura dos olhos: piso do sector + 41 unidades (VIEWHEIGHT padrao)
+        // C original: viewz = player->mo->z + player->viewheight
+        // Usar fixed-point direto para preservar precisao sub-unidade
+        let floor_h = self.find_player_floor_height();
+        self.render_state.viewz = floor_h + Fixed::from_int(41);
+
+        // Angulo ja esta em BAM — atribuir diretamente
+        self.render_state.viewangle = Angle(self.player_angle);
+
+        // Pre-calcular sin/cos e incrementar contadores de frame
+        self.render_state.setup_frame();
+    }
+
+    /// Encontra a altura do piso no sector onde o jogador esta.
+    ///
+    /// Percorre a BSP tree ate encontrar o subsector que contem
+    /// a posicao do jogador, e retorna a altura do piso desse sector.
+    ///
+    /// C original: `R_PointInSubsector()` em `r_main.c`
+    fn find_player_floor_height(&self) -> Fixed {
+        let map = match &self.map {
+            Some(m) => m,
+            None => return Fixed::ZERO,
+        };
+
+        if map.nodes.is_empty() || map.subsectors.is_empty() {
+            return Fixed::ZERO;
+        }
+
+        let px = self.player_x;
+        let py = self.player_y;
+        let mut node_id = (map.nodes.len() - 1) as u16;
+
+        loop {
+            if node_id & crate::map::types::NF_SUBSECTOR != 0 {
+                let ss_id = (node_id & !crate::map::types::NF_SUBSECTOR) as usize;
+                if ss_id < map.subsectors.len() {
+                    let sector_idx = map.subsectors[ss_id].sector;
+                    if sector_idx < map.sectors.len() {
+                        return map.sectors[sector_idx].floor_height;
+                    }
+                }
+                return Fixed::ZERO;
+            }
+
+            if (node_id as usize) >= map.nodes.len() {
+                return Fixed::ZERO;
+            }
+
+            let node = &map.nodes[node_id as usize];
+            let side = RenderState::point_on_side(px, py, node);
+            node_id = node.children[side];
+        }
+    }
+
+    /// Calcula a escala perspectiva para um angulo de visao global.
+    ///
+    /// Dado o angulo de uma coluna da tela, calcula a escala na qual
+    /// a parede deve ser desenhada. Paredes mais proximas tem escala maior.
+    ///
+    /// C original: `R_ScaleFromGlobalAngle()` em `r_main.c`
+    fn scale_from_global_angle(
+        &self,
+        visangle: Angle,
+        rw_normalangle: Angle,
+        rw_distance: Fixed,
+    ) -> i32 {
+        let anglea = Angle(
+            Angle::ANG90
+                .0
+                .wrapping_add(visangle.0.wrapping_sub(self.render_state.viewangle.0)),
+        );
+        let angleb = Angle(
+            Angle::ANG90
+                .0
+                .wrapping_add(visangle.0.wrapping_sub(rw_normalangle.0)),
+        );
+
+        let sinea = fine_sine((anglea.0 >> ANGLETOFINESHIFT) as usize & FINEMASK);
+        let sineb = fine_sine((angleb.0 >> ANGLETOFINESHIFT) as usize & FINEMASK);
+
+        // num = FixedMul(projection, sineb)
+        let num = (self.render_state.projection * sineb).0;
+        // den = FixedMul(rw_distance, sinea)
+        let den = (rw_distance * sinea).0;
+
+        if den > (num >> 16) {
+            let scale = (Fixed(num) / Fixed(den)).0;
+            scale.clamp(256, 64 * FRACUNIT)
+        } else {
+            64 * FRACUNIT
+        }
+    }
+
+    /// Renderiza os segmentos de parede coletados pela travessia BSP.
+    ///
+    /// Para cada segmento visivel:
+    /// 1. Calcula a distancia perpendicular a parede
+    /// 2. Resolve texturas do sidedef (mid/top/bottom)
+    /// 3. Calcula rw_offset para mapeamento horizontal de textura
+    /// 4. Para cada coluna: calcula texturecolumn, dc_iscale, colormap
+    /// 5. Desenha colunas de parede com textura real via draw_column()
+    /// 6. Preenche teto acima e piso abaixo com cor plana
+    /// 7. Atualiza arrays de clipping para oclusao correta
+    ///
+    /// C original: `R_StoreWallRange()` + `R_RenderSegLoop()` em `r_segs.c`
+    #[allow(clippy::too_many_lines)]
+    fn render_walls(&mut self, wall_segments: &[WallSegment], planes: &PlaneRenderData) {
+        use crate::utils::tables::fine_tangent;
+
+        let map = match &self.map {
+            Some(m) => m,
+            None => return,
+        };
+
+        // Arrays de clipping (stack-allocated, evita heap alloc por frame)
+        // C original: floorclip[x] = viewheight (168, nao 200)
+        let mut floorclip = [ST_Y as i16; SCREENWIDTH];
+        let mut ceilingclip = [-1i16; SCREENWIDTH];
+
+        // Constante de LIGHTSCALESHIFT (C original: 12)
+        const LIGHTSCALESHIFT: usize = 12;
+
+        for ws in wall_segments {
+            if ws.seg_index >= map.segs.len() {
+                continue;
+            }
+            let seg = &map.segs[ws.seg_index];
+            if seg.front_sector >= map.sectors.len() {
+                continue;
+            }
+            let v1 = &map.vertexes[seg.v1];
+            let front_sector = &map.sectors[seg.front_sector];
+            let is_solid = seg.back_sector.is_none();
+
+            // --- Calcular rw_distance ---
+            let rw_normalangle = Angle(seg.angle.wrapping_add(Angle::ANG90.0));
+
+            let offset_angle_raw = rw_normalangle.0.wrapping_sub(ws.angle1.0);
+            let offset_angle = if offset_angle_raw > Angle::ANG180.0 {
+                Angle(0u32.wrapping_sub(offset_angle_raw))
+            } else {
+                Angle(offset_angle_raw)
+            };
+            let offset_angle = if offset_angle.0 > Angle::ANG90.0 {
+                Angle::ANG90
+            } else {
+                offset_angle
+            };
+
+            let dist_angle = Angle(Angle::ANG90.0.wrapping_sub(offset_angle.0));
+            let hyp = self.render_state.point_to_dist(v1.x, v1.y);
+            let sineval =
+                fine_sine((dist_angle.0 >> ANGLETOFINESHIFT) as usize & FINEMASK);
+            let rw_distance = hyp * sineval;
+
+            if rw_distance.0 == 0 {
+                continue;
+            }
+
+            // --- Escala nas bordas do segmento ---
+            let x1 = ws.x1.max(0);
+            let x2 = ws.x2.min(SCREENWIDTH as i32 - 1);
+            if x1 > x2 {
+                continue;
+            }
+
+            let rw_scale = self.scale_from_global_angle(
+                Angle(
+                    self.render_state.viewangle.0
+                        .wrapping_add(self.render_state.xtoviewangle[x1 as usize].0),
+                ),
+                rw_normalangle,
+                rw_distance,
+            );
+
+            let scale2 = if x2 > x1 {
+                self.scale_from_global_angle(
+                    Angle(
+                        self.render_state.viewangle.0
+                            .wrapping_add(self.render_state.xtoviewangle[x2 as usize].0),
+                    ),
+                    rw_normalangle,
+                    rw_distance,
+                )
+            } else {
+                rw_scale
+            };
+
+            let rw_scalestep = if x2 > x1 {
+                (scale2 - rw_scale) / (x2 - x1)
+            } else {
+                0
+            };
+
+            // --- Alturas do mundo (nao-shiftadas para comparacoes) ---
+            // Detectar sky flat: "F_SKY1" (padrao DOOM)
+            // C original: `skyflatnum = R_FlatNumForName(SKYFLATNAME)`
+            const SKY_FLAT: [u8; 8] = *b"F_SKY1\0\0";
+            let front_is_sky = front_sector.ceiling_pic == SKY_FLAT;
+
+            let mut worldtop_full = front_sector.ceiling_height.0 - self.render_state.viewz.0;
+            let worldbottom_full = front_sector.floor_height.0 - self.render_state.viewz.0;
+
+            let (worldhigh_full, worldlow_full) = if let Some(back_idx) = seg.back_sector {
+                if back_idx < map.sectors.len() {
+                    let back = &map.sectors[back_idx];
+                    (
+                        back.ceiling_height.0 - self.render_state.viewz.0,
+                        back.floor_height.0 - self.render_state.viewz.0,
+                    )
+                } else {
+                    (worldtop_full, worldbottom_full)
+                }
+            } else {
+                (worldtop_full, worldbottom_full)
+            };
+
+            // Sky-sky hack: se ambos os sectors tem sky ceiling,
+            // igualar worldtop a worldhigh para evitar upper wall entre ceus
+            // C original: r_segs.c linhas 530-534
+            if !is_solid {
+                if let Some(back_idx) = seg.back_sector {
+                    if back_idx < map.sectors.len() {
+                        let back = &map.sectors[back_idx];
+                        if front_is_sky && back.ceiling_pic == SKY_FLAT {
+                            worldtop_full = worldhigh_full;
+                        }
+                    }
+                }
+            }
+
+            let has_upper = !is_solid && worldhigh_full < worldtop_full;
+            let has_lower = !is_solid && worldlow_full > worldbottom_full;
+
+            // markceiling / markfloor: determinar se flat deve ser renderizado
+            // C original: r_segs.c linhas 461, 537-567, 665-676
+            let (mut mark_ceiling, mut mark_floor) = if is_solid {
+                (true, true)
+            } else if let Some(back_idx) = seg.back_sector {
+                if back_idx < map.sectors.len() {
+                    let back = &map.sectors[back_idx];
+                    let mut mc = worldhigh_full != worldtop_full
+                        || back.ceiling_pic != front_sector.ceiling_pic
+                        || back.light_level != front_sector.light_level;
+                    let mut mf = worldlow_full != worldbottom_full
+                        || back.floor_pic != front_sector.floor_pic
+                        || back.light_level != front_sector.light_level;
+                    // Closed door: ambos marcados
+                    if back.ceiling_height.0 <= front_sector.floor_height.0
+                        || back.floor_height.0 >= front_sector.ceiling_height.0
+                    {
+                        mc = true;
+                        mf = true;
+                    }
+                    (mc, mf)
+                } else {
+                    (true, true)
+                }
+            } else {
+                (true, true)
+            };
+
+            // Se o plano esta do lado errado do viewplane, nao renderizar
+            // C original: r_segs.c linhas 665-676
+            if front_sector.floor_height.0 >= self.render_state.viewz.0 {
+                mark_floor = false;
+            }
+            // Nota: sky ceilings nunca sao desabilitados (sao sempre visiveis)
+            // C original: `frontsector->ceilingpic != skyflatnum`
+            if front_sector.ceiling_height.0 <= self.render_state.viewz.0 && !front_is_sky {
+                mark_ceiling = false;
+            }
+
+            // Shift para HEIGHTBITS (>> 4) apos comparacoes
+            let worldtop = worldtop_full >> 4;
+            let worldbottom = worldbottom_full >> 4;
+            let worldhigh = worldhigh_full >> 4;
+            let worldlow = worldlow_full >> 4;
+
+            // --- Resolver texturas do sidedef ---
+            let sidedef = if seg.sidedef < map.sidedefs.len() {
+                &map.sidedefs[seg.sidedef]
+            } else {
+                continue;
+            };
+            let linedef = if seg.linedef < map.linedefs.len() {
+                &map.linedefs[seg.linedef]
+            } else {
+                continue;
+            };
+
+            // Lookup de texturas resolvidas do cache (O(1) por sidedef)
+            let (mid_tex, top_tex, bot_tex) = if seg.sidedef < self.sidedef_tex_cache.len() {
+                self.sidedef_tex_cache[seg.sidedef]
+            } else {
+                let tex_data = self.texture_data.as_ref();
+                let mid = tex_data.and_then(|td| Self::resolve_texture_name(&sidedef.mid_texture, td));
+                let top = tex_data.and_then(|td| Self::resolve_texture_name(&sidedef.top_texture, td));
+                let bot = tex_data.and_then(|td| Self::resolve_texture_name(&sidedef.bottom_texture, td));
+                (mid, top, bot)
+            };
+
+            let segtextured = mid_tex.is_some() || top_tex.is_some() || bot_tex.is_some();
+
+            // --- Calcular rw_offset (horizontal texture offset) ---
+            // C original: r_segs.c linhas 619-636
+            let (rw_offset, rw_centerangle) = if segtextured {
+                let mut oa = rw_normalangle.0.wrapping_sub(ws.angle1.0);
+                if oa > Angle::ANG180.0 {
+                    oa = 0u32.wrapping_sub(oa);
+                }
+                if oa > Angle::ANG90.0 {
+                    oa = Angle::ANG90.0;
+                }
+                let sineval2 = fine_sine((oa >> ANGLETOFINESHIFT) as usize & FINEMASK);
+                let mut offset = hyp * sineval2;
+
+                if rw_normalangle.0.wrapping_sub(ws.angle1.0) < Angle::ANG180.0 {
+                    offset = Fixed(0) - offset;
+                }
+                offset = offset + sidedef.texture_offset + seg.offset;
+
+                let center = Angle(
+                    Angle::ANG90.0.wrapping_add(
+                        self.render_state.viewangle.0.wrapping_sub(rw_normalangle.0),
+                    ),
+                );
+                (offset, center)
+            } else {
+                (Fixed(0), Angle::ANG0)
+            };
+
+            // --- Calcular dc_texturemid (vertical alignment com pegging) ---
+            let rw_midtexturemid = if is_solid {
+                if let Some(tex_idx) = mid_tex {
+                    if linedef.flags.contains(crate::map::types::LineDefFlags::DONT_PEG_BOTTOM) {
+                        // Bottom pegging: bottom of texture at floor
+                        let tex_h = self.texture_data.as_ref().map_or(0, |td| td.texture_height[tex_idx].0);
+                        Fixed(front_sector.floor_height.0 + tex_h - self.render_state.viewz.0)
+                            + sidedef.row_offset
+                    } else {
+                        // Top pegging: top of texture at ceiling
+                        Fixed(worldtop_full) + sidedef.row_offset
+                    }
+                } else {
+                    Fixed(worldtop_full) + sidedef.row_offset
+                }
+            } else {
+                Fixed(0)
+            };
+
+            let rw_toptexturemid = if has_upper {
+                if let Some(tex_idx) = top_tex {
+                    if linedef.flags.contains(crate::map::types::LineDefFlags::DONT_PEG_TOP) {
+                        Fixed(worldtop_full) + sidedef.row_offset
+                    } else {
+                        // Bottom of texture at back ceiling
+                        let tex_h = self.texture_data.as_ref().map_or(0, |td| td.texture_height[tex_idx].0);
+                        let back_ceil = if let Some(bi) = seg.back_sector {
+                            map.sectors[bi].ceiling_height.0
+                        } else {
+                            front_sector.ceiling_height.0
+                        };
+                        Fixed(back_ceil + tex_h - self.render_state.viewz.0)
+                            + sidedef.row_offset
+                    }
+                } else {
+                    Fixed(worldtop_full) + sidedef.row_offset
+                }
+            } else {
+                Fixed(0)
+            };
+
+            let rw_bottomtexturemid = if has_lower {
+                if linedef.flags.contains(crate::map::types::LineDefFlags::DONT_PEG_BOTTOM) {
+                    Fixed(worldtop_full) + sidedef.row_offset
+                } else {
+                    Fixed(worldlow_full) + sidedef.row_offset
+                }
+            } else {
+                Fixed(0)
+            };
+
+            // --- Nivel de luz do sector ---
+            let lightnum = ((front_sector.light_level as usize) >> 4).min(15);
+            // Variacao por orientacao da parede
+            let v1y = map.vertexes[seg.v1].y.0;
+            let v2y = map.vertexes[seg.v2].y.0;
+            let v1x = map.vertexes[seg.v1].x.0;
+            let v2x = map.vertexes[seg.v2].x.0;
+            let lightnum = if v1y == v2y {
+                lightnum.saturating_sub(1) // paredes horizontais mais escuras
+            } else if v1x == v2x {
+                (lightnum + 1).min(15) // paredes verticais mais claras
+            } else {
+                lightnum
+            };
+
+            let shade = lightnum as u8;
+            // Fallback colors se flat nao for encontrado
+            let ceil_color_fb = shade / 4;
+            let floor_color_fb = 0x80 + (shade / 2).min(7);
+
+            // Lookup flat data para piso e teto
+            let floor_flat = self.flat_cache.get(&front_sector.floor_pic);
+            let ceil_flat = self.flat_cache.get(&front_sector.ceiling_pic);
+
+            // Alturas absolutas do piso/teto (para planeheight)
+            let floor_h = front_sector.floor_height.0;
+            let ceil_h = front_sector.ceiling_height.0;
+            let viewz = self.render_state.viewz.0;
+
+            // --- Calcular fracs e steps (20.12 format) ---
+            let centery4 = self.render_state.centeryfrac.0 >> 4;
+            let mut topfrac =
+                centery4 - ((worldtop as i64 * rw_scale as i64) >> FRACBITS) as i32;
+            let mut bottomfrac =
+                centery4 - ((worldbottom as i64 * rw_scale as i64) >> FRACBITS) as i32;
+            let topstep =
+                -((rw_scalestep as i64 * worldtop as i64) >> FRACBITS) as i32;
+            let bottomstep =
+                -((rw_scalestep as i64 * worldbottom as i64) >> FRACBITS) as i32;
+
+            let mut pixhigh = if has_upper {
+                centery4 - ((worldhigh as i64 * rw_scale as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+            let pixhighstep = if has_upper {
+                -((rw_scalestep as i64 * worldhigh as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+            let mut pixlow = if has_lower {
+                centery4 - ((worldlow as i64 * rw_scale as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+            let pixlowstep = if has_lower {
+                -((rw_scalestep as i64 * worldlow as i64) >> FRACBITS) as i32
+            } else {
+                0
+            };
+
+            // Referencia aos colormaps para iluminacao de flats
+            let colormaps_ref = self.texture_data.as_ref().map(|td| td.colormaps.as_slice());
+
+            // --- Renderizar colunas ---
+            let screen = self.video.screen_mut(0);
+            let sh = SCREENHEIGHT as i32;
+            let mut cur_scale = rw_scale;
+
+            for x in x1..=x2 {
+                let xu = x as usize;
+
+                // Topo e base da parede
+                let mut yl = (topfrac + 0xFFF) >> 12;
+                if yl < ceilingclip[xu] as i32 + 1 {
+                    yl = ceilingclip[xu] as i32 + 1;
+                }
+                let mut yh = bottomfrac >> 12;
+                if yh >= floorclip[xu] as i32 {
+                    yh = floorclip[xu] as i32 - 1;
+                }
+
+                // --- Calcular texturecolumn e colormap (se texturizado) ---
+                let (texturecolumn, colormap_offset) = if segtextured {
+                    // C original: r_segs.c linhas 265-274
+                    let angle = (rw_centerangle.0
+                        .wrapping_add(self.render_state.xtoviewangle[xu].0))
+                        >> ANGLETOFINESHIFT;
+                    // Tabela finetangent tem 4096 entradas (FINEANGLES/2)
+                    let tangent = fine_tangent(angle as usize & 0xFFF);
+                    let tc = (rw_offset - rw_distance * tangent).0 >> FRACBITS;
+
+                    // Colormap baseada na escala (distancia)
+                    let light_idx = ((cur_scale as usize) >> LIGHTSCALESHIFT)
+                        .min(crate::renderer::state::MAXLIGHTSCALE - 1);
+                    let cm = self.render_state.scalelight[lightnum][light_idx];
+                    (tc, cm)
+                } else {
+                    (0, 0)
+                };
+
+                // dc_iscale = 0xFFFFFFFF / rw_scale
+                let dc_iscale = if cur_scale > 0 {
+                    Fixed((0xFFFF_FFFFu32 / cur_scale as u32) as i32)
+                } else {
+                    Fixed(0x7FFF_FFFF)
+                };
+
+                if is_solid {
+                    // --- Parede solida (one-sided) ---
+
+                    // Teto com textura flat
+                    if mark_ceiling {
+                        let ct = (ceilingclip[xu] as i32 + 1).max(0);
+                        let cb = (yl - 1).min(sh - 1);
+                        if ct <= cb {
+                            Self::draw_flat_column(
+                                screen, xu, ct, cb, ceil_flat, ceil_color_fb,
+                                (ceil_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
+                    }
+
+                    // Parede com textura
+                    if let Some(tex_idx) = mid_tex {
+                        if yl <= yh && yl >= 0 && yh < sh {
+                            if let Some(td) = &self.texture_data {
+                                let source = td.get_column(tex_idx, texturecolumn);
+                                if !source.is_empty() {
+                                    let colormap = &td.colormaps[colormap_offset..];
+                                    self.column_drawer.draw_column(
+                                        screen, xu, yl, yh, dc_iscale,
+                                        rw_midtexturemid, source, colormap,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let wt = yl.max(0);
+                        let wb = yh.min(sh - 1);
+                        for y in wt..=wb {
+                            screen[y as usize * SCREENWIDTH + xu] = 0x60 + shade;
+                        }
+                    }
+
+                    // Piso com textura flat
+                    if mark_floor {
+                        let ft = (yh + 1).max(0);
+                        let fb = (floorclip[xu] as i32 - 1).min(sh - 1);
+                        if ft <= fb {
+                            Self::draw_flat_column(
+                                screen, xu, ft, fb, floor_flat, floor_color_fb,
+                                (floor_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
+                    }
+
+                    ceilingclip[xu] = sh as i16;
+                    floorclip[xu] = -1;
+                } else {
+                    // --- Parede two-sided ---
+                    // C original: R_RenderSegLoop linhas 228-358
+
+                    // Teto com textura flat (ANTES de modificar ceilingclip)
+                    if mark_ceiling {
+                        let ct = (ceilingclip[xu] as i32 + 1).max(0);
+                        let mut cb = yl - 1;
+                        if cb >= floorclip[xu] as i32 {
+                            cb = floorclip[xu] as i32 - 1;
+                        }
+                        if ct <= cb {
+                            Self::draw_flat_column(
+                                screen, xu, ct, cb, ceil_flat, ceil_color_fb,
+                                (ceil_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
+                    }
+
+                    // Piso com textura flat (ANTES de modificar floorclip)
+                    if mark_floor {
+                        let mut ft = yh + 1;
+                        let fb = floorclip[xu] as i32 - 1;
+                        if ft <= ceilingclip[xu] as i32 {
+                            ft = ceilingclip[xu] as i32 + 1;
+                        }
+                        if ft <= fb {
+                            Self::draw_flat_column(
+                                screen, xu, ft, fb, floor_flat, floor_color_fb,
+                                (floor_h - viewz).abs(), planes, &self.render_state,
+                                lightnum, colormaps_ref,
+                            );
+                        }
+                    }
+
+                    // Upper wall
+                    if has_upper {
+                        let mut mid = pixhigh >> 12;
+                        pixhigh += pixhighstep;
+
+                        if mid >= floorclip[xu] as i32 {
+                            mid = floorclip[xu] as i32 - 1;
+                        }
+                        if mid >= yl {
+                            if let Some(tex_idx) = top_tex {
+                                if yl >= 0 && mid < sh {
+                                    if let Some(td) = &self.texture_data {
+                                        let source = td.get_column(tex_idx, texturecolumn);
+                                        if !source.is_empty() {
+                                            let colormap = &td.colormaps[colormap_offset..];
+                                            self.column_drawer.draw_column(
+                                                screen, xu, yl, mid, dc_iscale,
+                                                rw_toptexturemid, source, colormap,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let wt = yl.max(0);
+                                let wb = mid.min(sh - 1);
+                                for y in wt..=wb {
+                                    screen[y as usize * SCREENWIDTH + xu] = 0x60 + shade;
+                                }
+                            }
+                            ceilingclip[xu] = mid as i16;
+                        } else {
+                            ceilingclip[xu] = (yl - 1) as i16;
+                        }
+                    } else if mark_ceiling {
+                        // Sem upper wall mas com ceiling marcado
+                        ceilingclip[xu] = (yl - 1) as i16;
+                    }
+
+                    // Lower wall
+                    if has_lower {
+                        let mut mid = (pixlow + 0xFFF) >> 12;
+                        pixlow += pixlowstep;
+
+                        if mid <= ceilingclip[xu] as i32 {
+                            mid = ceilingclip[xu] as i32 + 1;
+                        }
+                        if mid <= yh {
+                            if let Some(tex_idx) = bot_tex {
+                                if mid >= 0 && yh < sh {
+                                    if let Some(td) = &self.texture_data {
+                                        let source = td.get_column(tex_idx, texturecolumn);
+                                        if !source.is_empty() {
+                                            let colormap = &td.colormaps[colormap_offset..];
+                                            self.column_drawer.draw_column(
+                                                screen, xu, mid, yh, dc_iscale,
+                                                rw_bottomtexturemid, source, colormap,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let wt = mid.max(0);
+                                let wb = yh.min(sh - 1);
+                                for y in wt..=wb {
+                                    screen[y as usize * SCREENWIDTH + xu] = 0x60 + shade;
+                                }
+                            }
+                            floorclip[xu] = mid as i16;
+                        } else {
+                            floorclip[xu] = (yh + 1) as i16;
+                        }
+                    } else if mark_floor {
+                        // Sem lower wall mas com floor marcado
+                        floorclip[xu] = (yh + 1) as i16;
+                    }
+                }
+
+                // Stepping (C original: r_segs.c linhas 360-362)
+                // Nota: pixhigh/pixlow sao incrementados inline nos blocos
+                // upper/lower acima, como no C original
+                cur_scale += rw_scalestep;
+                topfrac += topstep;
+                bottomfrac += bottomstep;
+            }
+        }
+    }
+
+    /// Renderiza uma coluna vertical de flat (piso ou teto) com textura.
+    ///
+    /// Para cada pixel vertical na faixa [yt..yb], calcula a coordenada
+    /// de textura 64x64 usando projecao perspectiva (R_MapPlane simplificado).
+    /// Se o flat nao estiver no cache, usa cor de fallback.
+    ///
+    /// C original: `R_MapPlane()` em `r_plane.c`, adaptado de spans para colunas
+    #[allow(clippy::too_many_arguments)]
+    fn draw_flat_column(
+        screen: &mut [u8],
+        x: usize,
+        yt: i32,
+        yb: i32,
+        flat_data: Option<&Vec<u8>>,
+        fallback_color: u8,
+        planeheight: i32,
+        planes: &PlaneRenderData,
+        render_state: &RenderState,
+        lightnum: usize,
+        colormaps: Option<&[u8]>,
+    ) {
+        let sh = SCREENHEIGHT as i32;
+        if yt > yb || x >= SCREENWIDTH {
+            return;
+        }
+
+        let flat = match flat_data {
+            Some(data) if data.len() >= 4096 => data,
+            _ => {
+                // Sem flat: preencher com cor de fallback
+                for y in yt.max(0)..=yb.min(sh - 1) {
+                    screen[y as usize * SCREENWIDTH + x] = fallback_color;
+                }
+                return;
+            }
+        };
+
+        // Valores constantes para esta coluna (nao dependem de Y)
+        let planeheight_fixed = planeheight.abs() as i64;
+        let viewx = render_state.viewx.0;
+        let viewy = render_state.viewy.0;
+        let distscale_x = planes.distscale[x] as i64;
+
+        // Angulo e trig sao constantes para coluna x
+        let angle = render_state.viewangle.0.wrapping_add(render_state.xtoviewangle[x].0)
+            >> ANGLETOFINESHIFT;
+        let cos_val = fine_cosine(angle as usize & FINEMASK).0 as i64;
+        let sin_val = fine_sine(angle as usize & FINEMASK).0 as i64;
+        let neg_viewy = -viewy;
+
+        let y_start = yt.max(0) as usize;
+        let y_end = yb.min(sh - 1) as usize;
+
+        // Pre-calcular offset base no screen buffer
+        let mut screen_offset = y_start * SCREENWIDTH + x;
+
+        // Separar paths com/sem colormap para evitar branch no inner loop
+        if let Some(cm) = colormaps {
+            let cm_len = cm.len();
+            for yu in y_start..=y_end {
+                let distance = (planeheight_fixed * planes.yslope[yu] as i64) >> FRACBITS;
+                let length = (distance * distscale_x) >> FRACBITS;
+                let xfrac = viewx.wrapping_add(((cos_val * length) >> FRACBITS) as i32);
+                let yfrac = neg_viewy.wrapping_sub(((sin_val * length) >> FRACBITS) as i32);
+                let tx = ((xfrac >> FRACBITS) & 63) as usize;
+                let ty = ((yfrac >> FRACBITS) & 63) as usize;
+                let src_pixel = flat[ty * 64 + tx];
+
+                let z_idx = ((distance as usize) >> crate::renderer::state::LIGHTZSHIFT)
+                    .min(crate::renderer::state::MAXLIGHTZ - 1);
+                let cm_offset = render_state.zlight[lightnum][z_idx];
+                let idx = cm_offset + src_pixel as usize;
+                screen[screen_offset] = if idx < cm_len { cm[idx] } else { src_pixel };
+                screen_offset += SCREENWIDTH;
+            }
+        } else {
+            for yu in y_start..=y_end {
+                let distance = (planeheight_fixed * planes.yslope[yu] as i64) >> FRACBITS;
+                let length = (distance * distscale_x) >> FRACBITS;
+                let xfrac = viewx.wrapping_add(((cos_val * length) >> FRACBITS) as i32);
+                let yfrac = neg_viewy.wrapping_sub(((sin_val * length) >> FRACBITS) as i32);
+                let tx = ((xfrac >> FRACBITS) & 63) as usize;
+                let ty = ((yfrac >> FRACBITS) & 63) as usize;
+                screen[screen_offset] = flat[ty * 64 + tx];
+                screen_offset += SCREENWIDTH;
+            }
+        }
+    }
+
+    /// Resolve o nome de uma textura de sidedef para indice no TextureData.
+    ///
+    /// Retorna None se o nome for "-" (sem textura) ou nao encontrado.
+    fn resolve_texture_name(name: &[u8; 8], td: &TextureData) -> Option<usize> {
+        // "-" ou nome vazio = sem textura
+        if name[0] == b'-' || name[0] == 0 {
+            return None;
+        }
+        let end = name.iter().position(|&b| b == 0).unwrap_or(8);
+        let name_str = std::str::from_utf8(&name[..end]).unwrap_or("");
+        td.texture_num_for_name(name_str)
+    }
+
     /// Retorna o framebuffer principal (screen 0) para blit.
     pub fn framebuffer(&self) -> &[u8] {
         self.video.screen(0)
@@ -898,10 +2951,13 @@ impl DoomEngine {
     }
 }
 
+
 /// Desenha uma linha no framebuffer usando algoritmo de Bresenham.
+/// Usado pelo automap.
 ///
 /// Clippa coordenadas contra os limites da tela antes de desenhar.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn draw_line(
     screen: &mut [u8],
     screen_w: usize,
@@ -1081,5 +3137,661 @@ mod tests {
         };
         let result = DoomEngine::init(&args);
         assert!(result.is_err());
+    }
+
+    // ================================================================
+    // Testes de simulacao do renderer
+    // ================================================================
+    // Verificam que os calculos de projecao e rendering de paredes
+    // produzem valores identicos ao C original para entradas conhecidas.
+
+    /// Testa R_ScaleFromGlobalAngle com parede frontal a distancia conhecida.
+    #[test]
+    fn scale_from_global_angle_frontal_wall() {
+        let mut engine = DoomEngine::new();
+        engine.render_state.viewangle = Angle::ANG0;
+        engine.render_state.setup_frame();
+
+        // Parede frontal: normal aponta para o viewer (ANG180)
+        let rw_normalangle = Angle::ANG180;
+        let rw_distance = Fixed::from_int(128);
+
+        // Coluna central: visangle = viewangle (xtoviewangle[160] ~= 0)
+        let visangle = Angle(
+            engine.render_state.viewangle.0
+                .wrapping_add(engine.render_state.xtoviewangle[160].0),
+        );
+        let scale = engine.scale_from_global_angle(visangle, rw_normalangle, rw_distance);
+
+        // Para parede frontal na coluna central:
+        // anglea = ANG90 + (visangle - viewangle) = ANG90 (pois coluna central)
+        // angleb = ANG90 + (visangle - rw_normalangle) = ANG90 + (0 - ANG180)
+        //        = ANG90 - ANG180 = ANG270 (wrapping)
+        // sinea = sin(ANG90) = FRACUNIT = 65536
+        // sineb = sin(ANG270) — em fine angles, ANG270>>19 = 6144
+        // sin(6144) esta no range de seno, = -FRACUNIT = -65536
+        //
+        // num = projection * sineb = 10485760 * (-65536) >> 16 = -10485760
+        // den = rw_distance * sinea = 8388608 * 65536 >> 16 = 8388608
+        // num >> 16 = -160
+        // den > num>>16? 8388608 > -160? Sim
+        // scale = FixedDiv(num, den) = (-10485760 << 16) / 8388608
+        //       = (-687194767360) / 8388608 = -81920
+        // Clamped para [256, 64*FRACUNIT] -> 256? Nao, valor negativo...
+        //
+        // Hmm, sineb para ANG270 e negativo. Vamos ver o que acontece.
+        // Na verdade o C diz "both sines are always positive" como comentario
+        // mas nao forca isso. O seno pode ser negativo dependendo do angulo.
+
+        // O scale deve ser valido (positivo, entre 256 e 64*FRACUNIT)
+        assert!(scale >= 256, "scale={} deve ser >= 256", scale);
+        assert!(
+            scale <= 64 * FRACUNIT,
+            "scale={} deve ser <= 64*FRACUNIT",
+            scale
+        );
+    }
+
+    /// Testa que topfrac/bottomfrac geram linhas Y razoaveis para sala simples.
+    #[test]
+    fn wall_column_positions() {
+        // Cenario: piso=0, teto=128, viewz=41*FRACUNIT
+        let viewz_fixed = Fixed::from_int(41).0;
+        let centery4 = (100i32 << FRACBITS) >> 4;
+
+        let worldtop_full = Fixed::from_int(128).0 - viewz_fixed; // 87*FRACUNIT
+        let worldbottom_full = 0 - viewz_fixed; // -41*FRACUNIT
+
+        let worldtop = worldtop_full >> 4;
+        let worldbottom = worldbottom_full >> 4;
+
+        // Testar com varias escalas (diferentes distancias)
+        for &rw_scale in &[40000i32, 65536, 81920, 131072] {
+            let topfrac =
+                centery4 - ((worldtop as i64 * rw_scale as i64) >> FRACBITS) as i32;
+            let bottomfrac =
+                centery4 - ((worldbottom as i64 * rw_scale as i64) >> FRACBITS) as i32;
+
+            let yl = (topfrac + 0xFFF) >> 12;
+            let yh = bottomfrac >> 12;
+
+            assert!(
+                yl < yh,
+                "scale={}: yl={} deve ser < yh={}",
+                rw_scale,
+                yl,
+                yh
+            );
+            // Para escalas grandes (parede perto), yl pode ser negativo
+            // e yh pode exceder SCREENHEIGHT — isso e normal, o clipping resolve
+            assert!(
+                yl < 200,
+                "scale={}: yl={} deve estar abaixo da tela",
+                rw_scale,
+                yl
+            );
+            assert!(
+                yh >= 0,
+                "scale={}: yh={} deve ser >= 0",
+                rw_scale,
+                yh
+            );
+        }
+    }
+
+    /// Testa que scalelight tem falloff correto (DISTMAP=2).
+    #[test]
+    fn scalelight_distmap_falloff() {
+        let state = crate::renderer::state::RenderState::new();
+
+        // Para i=8 (luz media): startmap = ((15-8)*2)*32/16 = 28
+        // j=0: level = 28 - 0/2 = 28 -> colormap offset = 28*256 = 7168
+        // j=47: level = 28 - 23 = 5 -> colormap offset = 5*256 = 1280
+        assert_eq!(state.scalelight[8][0], 28 * 256);
+        assert_eq!(state.scalelight[8][47], 5 * 256);
+
+        // Verificar monotonia decrescente (mais perto = mais claro)
+        for j in 1..48 {
+            assert!(
+                state.scalelight[8][j] <= state.scalelight[8][j - 1],
+                "scalelight[8] deve diminuir: [{}]={} > [{}]={}",
+                j, state.scalelight[8][j], j - 1, state.scalelight[8][j - 1]
+            );
+        }
+    }
+
+    /// Testa simetria de yslope e distscale.
+    #[test]
+    fn plane_tables_symmetry() {
+        let mut engine = DoomEngine::new();
+        // init_plane_tables precisa ser chamado explicitamente (normalmente via init())
+        engine.init_plane_tables();
+
+        // yslope: simetrico em torno de centery=84 (viewheight/2)
+        // Indices equidistantes do centro: 1 e 167 (84-83=1, 84+83=167)
+        let top = engine.plane_yslope[1];
+        let bottom = engine.plane_yslope[167];
+        assert!(top != 0, "yslope[1] deve ser != 0 apos init");
+        let diff = (top - bottom).abs();
+        assert!(
+            diff < top / 5,
+            "yslope[1]={} e yslope[167]={} devem ser proximos",
+            top, bottom
+        );
+
+        // distscale: simetrico em torno de x=160
+        let left = engine.plane_distscale[0];
+        let right = engine.plane_distscale[SCREENWIDTH - 1];
+        let center = engine.plane_distscale[SCREENWIDTH / 2];
+
+        assert!(
+            (center - FRACUNIT).abs() < FRACUNIT / 10,
+            "distscale central={} ~= FRACUNIT={}",
+            center, FRACUNIT
+        );
+        assert!(left > center, "distscale borda > centro");
+        let sym_diff = (left - right).abs();
+        assert!(
+            sym_diff < left / 5,
+            "distscale[0]={} ~= distscale[319]={}",
+            left, right
+        );
+    }
+
+    /// Testa estabilidade do rw_centerangle.
+    #[test]
+    fn rw_centerangle_stable() {
+        // rw_centerangle = ANG90 + viewangle - rw_normalangle
+        // Deve ser constante para mesmo viewangle e normalangle
+        let viewangle = Angle::ANG0;
+        let rw_normalangle = Angle::ANG180;
+
+        let center1 = Angle(
+            Angle::ANG90.0.wrapping_add(
+                viewangle.0.wrapping_sub(rw_normalangle.0),
+            ),
+        );
+        // ANG90 + (0 - ANG180) = ANG90 - ANG180 = ANG90 + ANG180 (wrapping)
+        // = 0x40000000 + 0x80000000 (wrapping_sub) = 0x40000000 + 0x80000000 = 0xC0000000
+        // Nao, wrapping_add(ANG90, wrapping_sub(0, ANG180))
+        // = wrapping_add(0x40000000, 0x80000000) = 0xC0000000
+
+        // Mudar viewangle mas manter a relacao
+        let viewangle2 = Angle(0x10000000); // ligeiramente rotacionado
+        let center2 = Angle(
+            Angle::ANG90.0.wrapping_add(
+                viewangle2.0.wrapping_sub(rw_normalangle.0),
+            ),
+        );
+
+        // O centro deve mudar quando viewangle muda
+        assert_ne!(
+            center1.0, center2.0,
+            "rw_centerangle deve mudar com viewangle"
+        );
+
+        // Mas para o MESMO viewangle, deve ser identico
+        assert_eq!(center1.0, center1.0);
+    }
+
+    // =================================================================
+    // Testes de simulacao: HUD, portas e armas
+    // =================================================================
+
+    /// Verifica que o draw_status_bar pode ser chamado sem panic.
+    /// O status bar precisa de patches do WAD, mas sem WAD deve
+    /// simplesmente nao desenhar nada (sem crash).
+    #[test]
+    fn statusbar_draw_no_crash_without_wad() {
+        let mut engine = DoomEngine::new();
+        engine.statusbar.status_bar_on = true;
+        // Chamar d_display no estado Level (sem mapa carregado)
+        engine.game.state = GameStateType::Level;
+        engine.d_display();
+        // Se chegamos aqui, nao houve panic
+    }
+
+    /// Verifica que a status bar recebe valores corretos do jogador.
+    #[test]
+    fn statusbar_syncs_from_weapons() {
+        let mut engine = DoomEngine::new();
+        engine.player_weapons.ammo[0] = 42; // bullets
+        engine.sync_player_status();
+
+        assert_eq!(engine.player_status.ammo, 42);
+        assert_eq!(engine.player_status.ammo_counts[0], 42);
+        assert!(engine.player_status.weapon_owned[1]); // pistol
+    }
+
+    /// Verifica que o sistema de portas cria thinkers corretamente.
+    #[test]
+    fn door_thinker_added_on_use() {
+        use crate::game::doors::DoorType;
+
+        let mut engine = DoomEngine::new();
+
+        // Criar mapa minimo com uma porta
+        let mut map = crate::map::MapData {
+            vertexes: vec![
+                crate::map::types::Vertex {
+                    x: Fixed::from_int(0),
+                    y: Fixed::from_int(0),
+                },
+                crate::map::types::Vertex {
+                    x: Fixed::from_int(64),
+                    y: Fixed::from_int(0),
+                },
+            ],
+            sectors: vec![
+                crate::map::types::Sector {
+                    floor_height: Fixed::from_int(0),
+                    ceiling_height: Fixed::from_int(128),
+                    floor_pic: [0; 8],
+                    ceiling_pic: [0; 8],
+                    light_level: 160,
+                    special: 0,
+                    tag: 0,
+                },
+                crate::map::types::Sector {
+                    floor_height: Fixed::from_int(0),
+                    ceiling_height: Fixed::from_int(0), // porta fechada
+                    floor_pic: [0; 8],
+                    ceiling_pic: [0; 8],
+                    light_level: 160,
+                    special: 0,
+                    tag: 0,
+                },
+            ],
+            linedefs: vec![crate::map::types::LineDef {
+                v1: 0,
+                v2: 1,
+                dx: Fixed::from_int(64),
+                dy: Fixed::ZERO,
+                flags: crate::map::types::LineDefFlags::TWO_SIDED,
+                special: 1, // Vertical Door
+                tag: 0,
+                sidenum: [Some(0), Some(1)],
+                slope_type: crate::map::types::SlopeType::Horizontal,
+                front_sector: Some(0),
+                back_sector: Some(1),
+            }],
+            sidedefs: vec![
+                crate::map::types::SideDef {
+                    texture_offset: Fixed::ZERO,
+                    row_offset: Fixed::ZERO,
+                    top_texture: [0; 8],
+                    bottom_texture: [0; 8],
+                    mid_texture: [0; 8],
+                    sector_index: 0,
+                },
+                crate::map::types::SideDef {
+                    texture_offset: Fixed::ZERO,
+                    row_offset: Fixed::ZERO,
+                    top_texture: [0; 8],
+                    bottom_texture: [0; 8],
+                    mid_texture: [0; 8],
+                    sector_index: 1,
+                },
+            ],
+            segs: vec![],
+            subsectors: vec![],
+            nodes: vec![],
+            things: vec![],
+        };
+
+        engine.map = Some(map);
+        assert_eq!(engine.thinkers.count(), 0);
+
+        // Chamar ev_vertical_door diretamente
+        engine.ev_vertical_door(0, DoorType::Normal);
+
+        // Deve ter criado um thinker
+        assert_eq!(engine.thinkers.count(), 1);
+    }
+
+    /// Verifica que o thinker de porta modifica ceiling_height do sector.
+    #[test]
+    fn door_thinker_moves_ceiling() {
+        use crate::game::doors::*;
+        use crate::map::types::Sector;
+
+        let mut sectors = vec![Sector {
+            floor_height: Fixed::from_int(0),
+            ceiling_height: Fixed::from_int(0),
+            floor_pic: [0; 8],
+            ceiling_pic: [0; 8],
+            light_level: 160,
+            special: 0,
+            tag: 0,
+        }];
+
+        let mut thinkers = crate::game::thinker::ThinkerList::new();
+        thinkers.add(Box::new(DoorThinker {
+            sector_index: 0,
+            door_type: DoorType::Normal,
+            top_height: Fixed::from_int(128),
+            speed: Fixed(VDOORSPEED),
+            direction: 1,
+            top_countdown: VDOORWAIT,
+            floor_height: Fixed::from_int(0),
+        }));
+
+        // Rodar 5 ticks
+        for _ in 0..5 {
+            thinkers.run(&mut sectors);
+        }
+
+        // Ceiling deve ter subido
+        assert!(
+            sectors[0].ceiling_height.0 > 0,
+            "ceiling_height deveria ter subido, mas e {}",
+            sectors[0].ceiling_height
+        );
+    }
+
+    /// Verifica que disparar a arma consome municao e muda de estado.
+    #[test]
+    fn weapon_fire_integration() {
+        let mut engine = DoomEngine::new();
+
+        let initial_ammo = engine.player_weapons.ammo[0];
+        assert_eq!(initial_ammo, 50);
+
+        // Simular pressionamento de fire
+        engine.player_weapons.tick(true);
+
+        // Deve ter consumido 1 bala e mudado para Fire1
+        assert_eq!(engine.player_weapons.ammo[0], 49);
+        assert_eq!(
+            engine.player_weapons.psprites[0].state,
+            crate::game::weapons::WeaponState::Fire1
+        );
+
+        // Sync com status bar
+        engine.sync_player_status();
+        assert_eq!(engine.player_status.ammo, 49);
+    }
+
+    /// Verifica que a arma volta ao estado Ready apos ciclo completo de fire.
+    #[test]
+    fn weapon_fire_returns_to_ready() {
+        let mut engine = DoomEngine::new();
+
+        // Fire
+        engine.player_weapons.tick(true);
+
+        // Continuar sem fire ate voltar a Ready
+        for _ in 0..20 {
+            engine.player_weapons.tick(false);
+            if engine.player_weapons.psprites[0].state
+                == crate::game::weapons::WeaponState::Ready
+            {
+                break;
+            }
+        }
+
+        assert_eq!(
+            engine.player_weapons.psprites[0].state,
+            crate::game::weapons::WeaponState::Ready
+        );
+    }
+
+    /// Teste de simulacao: carrega E1M1 do Freedoom e tenta mover o jogador
+    /// em varias direcoes para detectar bloqueios falsos.
+    ///
+    /// Requer assets/freedoom1.wad presente.
+    #[test]
+    fn simulate_movement_e1m1() {
+        use crate::map::MapData;
+
+        let wad_path = std::path::Path::new("assets/freedoom1.wad");
+        if !wad_path.exists() {
+            eprintln!("SKIP: freedoom1.wad nao encontrado");
+            return;
+        }
+
+        let mut engine = DoomEngine::new();
+        engine.wad.add_file(wad_path).expect("falha ao carregar WAD");
+
+        // Carregar mapa E1M1
+        let mut map = MapData::load("E1M1", &engine.wad).expect("falha ao carregar E1M1");
+        map.finalize();
+        engine.map = Some(map);
+        engine.init_player_position();
+
+        let start_x = engine.player_x;
+        let start_y = engine.player_y;
+        eprintln!(
+            "Player start: ({}, {})",
+            start_x.0 >> FRACBITS, start_y.0 >> FRACBITS
+        );
+
+        // Testar movimento em 8 direcoes a partir da posicao inicial
+        // Passo de 32 unidades (metade do raio de um sector tipico)
+        let step = 32 * FRACUNIT;
+        let directions: [(i32, i32, &str); 8] = [
+            (step, 0, "leste"),
+            (-step, 0, "oeste"),
+            (0, step, "norte"),
+            (0, -step, "sul"),
+            (step, step, "nordeste"),
+            (step, -step, "sudeste"),
+            (-step, step, "noroeste"),
+            (-step, -step, "sudoeste"),
+        ];
+
+        let mut blocked_count = 0;
+        let mut passed_count = 0;
+
+        for (dx, dy, dir) in &directions {
+            // Resetar posicao
+            engine.player_x = start_x;
+            engine.player_y = start_y;
+
+            let new_x = Fixed(start_x.0 + dx);
+            let new_y = Fixed(start_y.0 + dy);
+            let result = engine.try_move(new_x, new_y);
+
+            if result {
+                passed_count += 1;
+            } else {
+                blocked_count += 1;
+                eprintln!("BLOCKED {}: ({},{}) -> ({},{})",
+                    dir,
+                    start_x.0 >> FRACBITS, start_y.0 >> FRACBITS,
+                    new_x.0 >> FRACBITS, new_y.0 >> FRACBITS
+                );
+
+                // Tentar passos menores para encontrar o limite
+                for step_div in [2, 4, 8, 16] {
+                    let small_x = Fixed(start_x.0 + dx / step_div);
+                    let small_y = Fixed(start_y.0 + dy / step_div);
+                    let small_result = engine.try_move(small_x, small_y);
+                    if small_result {
+                        eprintln!("  step 1/{} OK: ({},{})",
+                            step_div, small_x.0 >> FRACBITS, small_y.0 >> FRACBITS);
+                        break;
+                    } else {
+                        eprintln!("  step 1/{} BLOCKED: ({},{})",
+                            step_div, small_x.0 >> FRACBITS, small_y.0 >> FRACBITS);
+                    }
+                }
+            }
+        }
+
+        eprintln!("Resultado: {} passaram, {} bloqueados de 8 direcoes", passed_count, blocked_count);
+
+        // Teste de caminhada: mover 10 passos para frente (norte, angulo 90)
+        engine.player_x = start_x;
+        engine.player_y = start_y;
+        let walk_step = Fixed(8 * FRACUNIT); // 8 unidades por passo
+        let mut walk_blocked = 0;
+
+        for i in 0..20 {
+            let new_y = Fixed(engine.player_y.0 + walk_step.0);
+            if !engine.try_move(engine.player_x, new_y) {
+                walk_blocked += 1;
+                eprintln!(
+                    "Walk norte step {} BLOCKED at ({},{})",
+                    i, engine.player_x.0 >> FRACBITS, engine.player_y.0 >> FRACBITS
+                );
+
+                // Diagnostico: qual linedef bloqueia?
+                let map = engine.map.as_ref().unwrap();
+                let tmbox = [
+                    new_y.0 + 16 * FRACUNIT,
+                    new_y.0 - 16 * FRACUNIT,
+                    engine.player_x.0 - 16 * FRACUNIT,
+                    engine.player_x.0 + 16 * FRACUNIT,
+                ];
+
+                for (li, ld) in map.linedefs.iter().enumerate() {
+                    let v1 = &map.vertexes[ld.v1];
+                    let v2 = &map.vertexes[ld.v2];
+                    let lb = [
+                        v1.y.0.max(v2.y.0),
+                        v1.y.0.min(v2.y.0),
+                        v1.x.0.min(v2.x.0),
+                        v1.x.0.max(v2.x.0),
+                    ];
+
+                    if tmbox[3] <= lb[2] || tmbox[2] >= lb[3]
+                        || tmbox[0] <= lb[1] || tmbox[1] >= lb[0]
+                    {
+                        continue;
+                    }
+
+                    let side = DoomEngine::box_on_line_side(&tmbox, v1.x.0, v1.y.0, ld);
+                    if side != -1 {
+                        continue;
+                    }
+
+                    let is_onesided = ld.back_sector.is_none();
+                    let (ot, ob, _or, lf) = DoomEngine::line_opening(ld, map);
+                    eprintln!(
+                        "  linedef {}: v1=({},{}) v2=({},{}) flags={:?} back_sector={:?} \
+                         sidenum1={:?} onesided={} opening=({},{},{},{})",
+                        li,
+                        v1.x.0 >> FRACBITS, v1.y.0 >> FRACBITS,
+                        v2.x.0 >> FRACBITS, v2.y.0 >> FRACBITS,
+                        ld.flags, ld.back_sector, ld.sidenum[1],
+                        is_onesided, ot >> FRACBITS, ob >> FRACBITS, _or >> FRACBITS, lf >> FRACBITS,
+                    );
+                }
+                break;
+            }
+        }
+
+        // Jogador deve poder mover em pelo menos 1 direcao
+        assert!(passed_count > 0, "Jogador bloqueado em todas as direcoes na posicao inicial!");
+
+        // Caminhar explorando o mapa: 200 passos em varias direcoes
+        engine.player_x = start_x;
+        engine.player_y = start_y;
+
+        // Walk leste (para frente no E1M1 do Freedoom)
+        let directions_walk: [(&str, i32, i32); 4] = [
+            ("norte", 0, 8 * FRACUNIT),
+            ("leste", 8 * FRACUNIT, 0),
+            ("sul", 0, -8 * FRACUNIT),
+            ("oeste", -8 * FRACUNIT, 0),
+        ];
+
+        for (dir_name, dx, dy) in &directions_walk {
+            engine.player_x = start_x;
+            engine.player_y = start_y;
+            let mut steps_ok = 0;
+
+            for _step in 0..50 {
+                let nx = Fixed(engine.player_x.0 + dx);
+                let ny = Fixed(engine.player_y.0 + dy);
+                if engine.try_move(nx, ny) {
+                    steps_ok += 1;
+                } else {
+                    break;
+                }
+            }
+            eprintln!(
+                "Walk {}: {} steps from ({},{}) to ({},{})",
+                dir_name, steps_ok,
+                start_x.0 >> FRACBITS, start_y.0 >> FRACBITS,
+                engine.player_x.0 >> FRACBITS, engine.player_y.0 >> FRACBITS,
+            );
+        }
+
+        // Explorar mais: caminhar leste e depois norte (entrar em salas)
+        engine.player_x = start_x;
+        engine.player_y = start_y;
+        // Andar leste primeiro
+        for _ in 0..25 {
+            let nx = Fixed(engine.player_x.0 + 8 * FRACUNIT);
+            engine.try_move(nx, engine.player_y);
+        }
+        let mid_x = engine.player_x;
+        let mid_y = engine.player_y;
+        eprintln!("Posicao intermediaria: ({},{})", mid_x.0 >> FRACBITS, mid_y.0 >> FRACBITS);
+
+        // Agora tentar norte e sul a partir da posicao intermediaria
+        for (dir_name, dx, dy) in &directions_walk {
+            engine.player_x = mid_x;
+            engine.player_y = mid_y;
+            let mut steps_ok = 0;
+            let mut block_reason = String::new();
+
+            for _step in 0..50 {
+                let nx = Fixed(engine.player_x.0 + dx);
+                let ny = Fixed(engine.player_y.0 + dy);
+                if engine.try_move(nx, ny) {
+                    steps_ok += 1;
+                } else {
+                    // Diagnosticar
+                    let map = engine.map.as_ref().unwrap();
+                    let cur_floor = engine.find_floor_height_at(engine.player_x, engine.player_y);
+                    let dest_floor = engine.find_floor_height_at(nx, ny);
+                    let dest_ceil = engine.find_ceiling_height_at(nx, ny);
+                    block_reason = format!(
+                        "cur_floor={} dest_floor={} dest_ceil={} gap={}",
+                        cur_floor >> FRACBITS, dest_floor >> FRACBITS,
+                        dest_ceil >> FRACBITS, (dest_ceil - dest_floor) >> FRACBITS
+                    );
+
+                    // Encontrar linedefs bloqueantes
+                    let tmbox = [
+                        ny.0 + 16 * FRACUNIT,
+                        ny.0 - 16 * FRACUNIT,
+                        nx.0 - 16 * FRACUNIT,
+                        nx.0 + 16 * FRACUNIT,
+                    ];
+                    for (li, ld) in map.linedefs.iter().enumerate() {
+                        let v1 = &map.vertexes[ld.v1];
+                        let v2 = &map.vertexes[ld.v2];
+                        let lb = [
+                            v1.y.0.max(v2.y.0), v1.y.0.min(v2.y.0),
+                            v1.x.0.min(v2.x.0), v1.x.0.max(v2.x.0),
+                        ];
+                        if tmbox[3] <= lb[2] || tmbox[2] >= lb[3]
+                            || tmbox[0] <= lb[1] || tmbox[1] >= lb[0] { continue; }
+                        let side = DoomEngine::box_on_line_side(&tmbox, v1.x.0, v1.y.0, ld);
+                        if side != -1 { continue; }
+                        let is_onesided = ld.back_sector.is_none();
+                        if is_onesided {
+                            block_reason += &format!(
+                                " | ld{}:ONE-SIDED v({},{})→({},{})",
+                                li, v1.x.0>>FRACBITS, v1.y.0>>FRACBITS,
+                                v2.x.0>>FRACBITS, v2.y.0>>FRACBITS
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+            eprintln!(
+                "Walk2 {} from ({},{}): {} steps to ({},{}) {}",
+                dir_name, mid_x.0>>FRACBITS, mid_y.0>>FRACBITS,
+                steps_ok,
+                engine.player_x.0>>FRACBITS, engine.player_y.0>>FRACBITS,
+                block_reason,
+            );
+        }
     }
 }

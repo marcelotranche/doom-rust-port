@@ -79,6 +79,7 @@ impl GameTicker {
         &mut self,
         game: &mut GameState,
         thinkers: &mut ThinkerList,
+        sectors: &mut [crate::map::types::Sector],
     ) -> TickResult {
         // Processar acao pendente (transicao de estado)
         let action = game.process_action();
@@ -107,7 +108,7 @@ impl GameTicker {
         if !game.paused {
             match game.state {
                 GameStateType::Level => {
-                    self.tick_level(game, thinkers);
+                    self.tick_level(game, thinkers, sectors);
                 }
                 GameStateType::Intermission => {
                     self.tick_intermission(game);
@@ -131,14 +132,19 @@ impl GameTicker {
     /// os ticcmds do jogador local.
     ///
     /// C original: `P_Ticker()` em `p_tick.c`
-    fn tick_level(&mut self, game: &mut GameState, thinkers: &mut ThinkerList) {
+    fn tick_level(
+        &mut self,
+        game: &mut GameState,
+        thinkers: &mut ThinkerList,
+        sectors: &mut [crate::map::types::Sector],
+    ) {
         // Aplicar ticcmd do jogador ao mobj (P_PlayerThink)
         // No port completo, isso moveria o jogador, verificaria
         // colisoes, dispararia armas, etc.
         let _tic_index = game.gametic as usize % super::state::BACKUPTICS;
 
         // Executar thinkers (P_RunThinkers)
-        thinkers.run();
+        thinkers.run(sectors);
     }
 
     /// Executa um tick de intermissao (WI_Ticker).
@@ -219,7 +225,7 @@ mod tests {
         game.playeringame[0] = true;
 
         let initial = game.gametic;
-        ticker.tick(&mut game, &mut thinkers);
+        ticker.tick(&mut game, &mut thinkers, &mut []);
         assert_eq!(game.gametic, initial + 1);
     }
 
@@ -230,7 +236,7 @@ mod tests {
         let mut thinkers = ThinkerList::new();
 
         game.action = GameAction::LoadLevel;
-        ticker.tick(&mut game, &mut thinkers);
+        ticker.tick(&mut game, &mut thinkers, &mut []);
         assert_eq!(game.state, GameStateType::Level);
         assert!(game.viewactive);
     }
@@ -245,7 +251,7 @@ mod tests {
         game.playeringame[0] = true;
 
         let page_before = ticker.demo_page_tic;
-        ticker.tick(&mut game, &mut thinkers);
+        ticker.tick(&mut game, &mut thinkers, &mut []);
         // Gametic still advances (como no DOOM original — pause nao para o gametic)
         // Mas os thinkers nao rodam
         assert_eq!(ticker.demo_page_tic, page_before);
@@ -261,7 +267,7 @@ mod tests {
 
         // Rodar ate mudar de pagina
         for _ in 0..ticker.demo_page_ticks {
-            ticker.tick(&mut game, &mut thinkers);
+            ticker.tick(&mut game, &mut thinkers, &mut []);
         }
         assert_eq!(ticker.demo_page, 1);
     }
@@ -273,7 +279,7 @@ mod tests {
         #[derive(Debug)]
         struct CounterThinker(i32);
         impl Thinker for CounterThinker {
-            fn think(&mut self) -> bool {
+            fn think(&mut self, _sectors: &mut [crate::map::types::Sector]) -> bool {
                 self.0 += 1;
                 true
             }
@@ -286,7 +292,7 @@ mod tests {
         let mut thinkers = ThinkerList::new();
         thinkers.add(Box::new(CounterThinker(0)));
 
-        ticker.tick(&mut game, &mut thinkers);
+        ticker.tick(&mut game, &mut thinkers, &mut []);
         // Thinker deveria ter sido executado
         assert_eq!(thinkers.count(), 1);
     }
@@ -298,7 +304,7 @@ mod tests {
         let mut thinkers = ThinkerList::new();
 
         game.action = GameAction::NewGame;
-        ticker.tick(&mut game, &mut thinkers);
+        ticker.tick(&mut game, &mut thinkers, &mut []);
         // NewGame seta LoadLevel como proxima acao
         assert_eq!(game.action, GameAction::LoadLevel);
     }
@@ -310,7 +316,7 @@ mod tests {
         let mut thinkers = ThinkerList::new();
         game.playeringame[0] = true;
 
-        let result = ticker.tick(&mut game, &mut thinkers);
+        let result = ticker.tick(&mut game, &mut thinkers, &mut []);
         assert_eq!(result, TickResult::Continue);
     }
 }

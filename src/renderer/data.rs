@@ -110,6 +110,14 @@ pub struct TextureData {
     /// Tabela de traducao de texturas (para animacao)
     pub texture_translation: Vec<usize>,
 
+    /// Cache de colunas compostas por textura.
+    /// Para cada textura, um Vec<u8> contendo todas as colunas
+    /// concatenadas (cada coluna tem `height` bytes).
+    /// Acesso: composite[tex][col * height .. (col+1) * height]
+    ///
+    /// C original: `texturecomposite[]` + `texturecolumnofs[]`
+    pub texture_composite: Vec<Vec<u8>>,
+
     /// Indice do primeiro lump de flat no WAD
     pub first_flat: usize,
     /// Numero total de flats
@@ -132,6 +140,10 @@ pub struct TextureData {
     /// 34 tabelas de 256 bytes cada (32 niveis + fullbright + invulnerability).
     /// C original: `lighttable_t* colormaps` em `r_data.c`
     pub colormaps: Vec<u8>,
+
+    /// Cache de nome de textura -> indice para lookup O(1).
+    /// Evita busca linear em texture_num_for_name().
+    texture_name_map: std::collections::HashMap<[u8; 8], usize>,
 }
 
 impl TextureData {
@@ -160,6 +172,9 @@ impl TextureData {
         let num_textures = textures.len();
         let texture_translation: Vec<usize> = (0..num_textures).collect();
 
+        // Gerar composites de todas as texturas
+        let texture_composite = Self::generate_all_composites(&textures, wad);
+
         let (first_flat, num_flats) = Self::find_flat_range(wad)?;
         let flat_translation: Vec<usize> = (0..num_flats).collect();
 
@@ -176,11 +191,22 @@ impl TextureData {
             num_sprite_lumps,
         );
 
+        // Construir cache de nome -> indice para lookup O(1)
+        let mut texture_name_map = std::collections::HashMap::with_capacity(num_textures);
+        for (i, tex) in textures.iter().enumerate() {
+            let mut key = tex.name;
+            for b in &mut key {
+                *b = b.to_ascii_uppercase();
+            }
+            texture_name_map.insert(key, i);
+        }
+
         Ok(TextureData {
             textures,
             texture_height,
             texture_width_mask,
             texture_translation,
+            texture_composite,
             first_flat,
             num_flats,
             flat_translation,
@@ -190,6 +216,7 @@ impl TextureData {
             sprite_offset,
             sprite_top_offset,
             colormaps,
+            texture_name_map,
         })
     }
 
@@ -368,21 +395,11 @@ impl TextureData {
     ///
     /// C original: `R_TextureNumForName()` em `r_data.c`
     pub fn texture_num_for_name(&self, name: &str) -> Option<usize> {
-        let search = {
-            let mut buf = [0u8; 8];
-            for (i, b) in name.bytes().take(8).enumerate() {
-                buf[i] = b.to_ascii_uppercase();
-            }
-            buf
-        };
-
-        self.textures.iter().position(|t| {
-            let mut t_name = t.name;
-            for b in &mut t_name {
-                *b = b.to_ascii_uppercase();
-            }
-            t_name == search
-        })
+        let mut search = [0u8; 8];
+        for (i, b) in name.bytes().take(8).enumerate() {
+            search[i] = b.to_ascii_uppercase();
+        }
+        self.texture_name_map.get(&search).copied()
     }
 
     /// Retorna o indice do lump de um flat pelo nome.
@@ -405,6 +422,166 @@ impl TextureData {
     /// Retorna o indice de flat traduzido (para animacao).
     pub fn translated_flat(&self, index: usize) -> usize {
         self.flat_translation[index]
+    }
+
+    /// Retorna uma coluna de pixels de uma textura.
+    ///
+    /// A coluna e um slice de `height` bytes da textura composita.
+    /// O indice `col` e mascarado pela largura da textura para wrap horizontal.
+    ///
+    /// C original: `R_GetColumn()` em `r_data.c`
+    pub fn get_column(&self, tex: usize, col: i32) -> &[u8] {
+        let col = (col & self.texture_width_mask[tex]) as usize;
+        let height = self.textures[tex].height as usize;
+        let composite = &self.texture_composite[tex];
+        let offset = col * height;
+        let end = (offset + height).min(composite.len());
+        if offset < composite.len() {
+            &composite[offset..end]
+        } else {
+            // Fallback: retornar zeros se a textura nao foi gerada
+            &[]
+        }
+    }
+
+    /// Gera os composites de todas as texturas.
+    ///
+    /// Para cada textura, compoe todos os patches num buffer linear
+    /// organizado coluna por coluna: col0[0..h], col1[0..h], ...
+    ///
+    /// C original: `R_GenerateComposite()` + `R_GenerateLookup()` em `r_data.c`
+    fn generate_all_composites(textures: &[TextureDef], wad: &WadSystem) -> Vec<Vec<u8>> {
+        textures
+            .iter()
+            .map(|tex| Self::generate_composite(tex, wad))
+            .collect()
+    }
+
+    /// Gera o composite de uma unica textura.
+    ///
+    /// Compoe os patches na area retangular da textura.
+    /// O resultado e um buffer de width*height bytes, organizado
+    /// coluna por coluna para acesso eficiente no renderer.
+    ///
+    /// C original: `R_GenerateComposite()` em `r_data.c`
+    fn generate_composite(tex: &TextureDef, wad: &WadSystem) -> Vec<u8> {
+        let width = tex.width as usize;
+        let height = tex.height as usize;
+        // Buffer organizado coluna-por-coluna: composite[col * height + row]
+        let mut composite = vec![0u8; width * height];
+
+        for patch_def in &tex.patches {
+            // Ler dados do patch do WAD
+            let patch_data = match wad.read_lump(patch_def.patch_lump) {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
+
+            if patch_data.len() < 8 {
+                continue;
+            }
+
+            // Header do patch: width(i16), height(i16), leftoffset(i16), topoffset(i16)
+            let patch_width =
+                i16::from_le_bytes([patch_data[0], patch_data[1]]) as usize;
+            let patch_height =
+                i16::from_le_bytes([patch_data[2], patch_data[3]]) as usize;
+
+            // Tabela de columnofs: patch_width entradas de u32
+            let column_table_start = 8;
+            if patch_data.len() < column_table_start + patch_width * 4 {
+                continue;
+            }
+
+            // Para cada coluna do patch que cai dentro da textura
+            for pcol in 0..patch_width {
+                let dest_col = patch_def.origin_x + pcol as i32;
+                if dest_col < 0 || dest_col >= width as i32 {
+                    continue;
+                }
+                let dest_col = dest_col as usize;
+
+                // Ler offset da coluna no patch
+                let ofs_pos = column_table_start + pcol * 4;
+                let col_offset = u32::from_le_bytes([
+                    patch_data[ofs_pos],
+                    patch_data[ofs_pos + 1],
+                    patch_data[ofs_pos + 2],
+                    patch_data[ofs_pos + 3],
+                ]) as usize;
+
+                // Parse dos posts da coluna (formato column_t)
+                Self::draw_column_in_cache(
+                    &patch_data,
+                    col_offset,
+                    &mut composite,
+                    dest_col,
+                    patch_def.origin_y,
+                    height,
+                    patch_height,
+                );
+            }
+        }
+
+        composite
+    }
+
+    /// Desenha uma coluna de patch no cache do composite.
+    ///
+    /// Parse o formato de posts do DOOM: sequencia de (topdelta, length, pixels)
+    /// terminada por topdelta = 0xFF. Cada post tem 1 byte de padding antes
+    /// e depois dos pixels.
+    ///
+    /// C original: `R_DrawColumnInCache()` em `r_data.c`
+    fn draw_column_in_cache(
+        patch_data: &[u8],
+        col_offset: usize,
+        composite: &mut [u8],
+        dest_col: usize,
+        origin_y: i32,
+        tex_height: usize,
+        _patch_height: usize,
+    ) {
+        let mut pos = col_offset;
+
+        // Parse posts ate encontrar topdelta = 0xFF
+        loop {
+            if pos >= patch_data.len() {
+                break;
+            }
+            let topdelta = patch_data[pos];
+            if topdelta == 0xFF {
+                break;
+            }
+
+            if pos + 1 >= patch_data.len() {
+                break;
+            }
+            let length = patch_data[pos + 1] as usize;
+
+            // Dados do post: pos+3 (pos+2 = padding byte)
+            let data_start = pos + 3;
+
+            for i in 0..length {
+                let mut position = origin_y + topdelta as i32 + i as i32;
+                if position < 0 {
+                    continue;
+                }
+                if position >= tex_height as i32 {
+                    break;
+                }
+                position %= tex_height as i32;
+
+                let src_idx = data_start + i;
+                if src_idx < patch_data.len() {
+                    composite[dest_col * tex_height + position as usize] =
+                        patch_data[src_idx];
+                }
+            }
+
+            // Avancar para proximo post: topdelta(1) + length(1) + padding(1) + data(length) + padding(1)
+            pos += 4 + length;
+        }
     }
 }
 
@@ -461,11 +638,15 @@ mod tests {
             patches: vec![],
         };
 
+        let mut texture_name_map = std::collections::HashMap::new();
+        texture_name_map.insert(*b"STARTAN3", 0);
+
         let td = TextureData {
             textures: vec![tex],
             texture_height: vec![Fixed(128 << FRACBITS)],
             texture_width_mask: vec![63],
             texture_translation: vec![0],
+            texture_composite: vec![vec![0u8; 64 * 128]],
             first_flat: 0,
             num_flats: 0,
             flat_translation: vec![],
@@ -475,6 +656,7 @@ mod tests {
             sprite_offset: vec![],
             sprite_top_offset: vec![],
             colormaps: vec![],
+            texture_name_map,
         };
 
         assert_eq!(td.texture_num_for_name("STARTAN3"), Some(0));

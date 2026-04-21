@@ -157,9 +157,9 @@ impl RenderState {
             viewsin: Fixed::ZERO,
 
             centerx: (SCREENWIDTH / 2) as i32,
-            centery: 100, // SCREENHEIGHT / 2
+            centery: 84, // VIEWHEIGHT / 2 (168 / 2, nao SCREENHEIGHT / 2)
             centerxfrac: Fixed((SCREENWIDTH as i32 / 2) << FRACBITS),
-            centeryfrac: Fixed(100 << FRACBITS),
+            centeryfrac: Fixed(84 << FRACBITS),
             projection: Fixed((SCREENWIDTH as i32 / 2) << FRACBITS),
 
             viewangletox: vec![0i32; FINEANGLES / 2],
@@ -183,12 +183,16 @@ impl RenderState {
 
     /// Inicializa as tabelas de projecao (viewangletox, xtoviewangle).
     ///
-    /// C original: partes de `R_InitTextureMapping()` em `r_main.c`
+    /// C original: `R_InitTextureMapping()` em `r_main.c`
     fn init_tables(&mut self) {
-        let fov_tangent = fine_tangent(FIELDOFVIEW);
-        let focallength = Fixed::from_int(SCREENWIDTH as i32 / 2) / fov_tangent;
+        // focallength = FixedDiv(centerxfrac, finetangent[FINEANGLES/4 + FIELDOFVIEW/2])
+        // Indice: 2048 + 1024 = 3072 para FOV de 90 graus
+        let fov_tangent = fine_tangent(FINEANGLES / 4 + FIELDOFVIEW / 2);
+        let focallength = self.centerxfrac / fov_tangent;
 
         // Mapear angulos para colunas X
+        // t = FixedMul(finetangent[i], focallength)
+        // viewangletox[i] = (centerxfrac - t + FRACUNIT - 1) >> FRACBITS
         for i in 0..FINEANGLES / 2 {
             let tangent = fine_tangent(i);
             let t = if tangent.0 > FRACUNIT * 2 {
@@ -196,14 +200,16 @@ impl RenderState {
             } else if tangent.0 < -FRACUNIT * 2 {
                 (SCREENWIDTH + 1) as i32
             } else {
-                let t = focallength / tangent;
-                let x = self.centerx - t.to_int();
+                // FixedMul(tangent, focallength)
+                let t = (tangent * focallength).0;
+                let x = (self.centerxfrac.0 - t + FRACUNIT - 1) >> FRACBITS;
                 x.clamp(-1, (SCREENWIDTH + 1) as i32)
             };
             self.viewangletox[i] = t;
         }
 
-        // Construir xtoviewangle (inverso)
+        // Construir xtoviewangle (inverso):
+        // Para cada coluna X, encontrar o menor angulo que mapeia para X
         for x in 0..=SCREENWIDTH {
             let mut i = 0;
             while i < FINEANGLES / 2 && self.viewangletox[i] > x as i32 {
@@ -211,6 +217,16 @@ impl RenderState {
             }
             let angle_raw = ((i as u32) << ANGLETOFINESHIFT).wrapping_sub(Angle::ANG90.0);
             self.xtoviewangle[x] = Angle(angle_raw);
+        }
+
+        // Fencepost correction: remover sentinelas de viewangletox
+        // C original: loop final de R_InitTextureMapping
+        for i in 0..FINEANGLES / 2 {
+            if self.viewangletox[i] == -1 {
+                self.viewangletox[i] = 0;
+            } else if self.viewangletox[i] == (SCREENWIDTH + 1) as i32 {
+                self.viewangletox[i] = SCREENWIDTH as i32;
+            }
         }
 
         // Clip angle
@@ -224,17 +240,30 @@ impl RenderState {
     ///
     /// C original: `R_InitLightTables()` em `r_main.c`
     fn init_light_tables(&mut self) {
+        // DISTMAP controla o falloff de iluminacao com distancia
+        // C original: `#define DISTMAP 2` em `r_main.c`
+        const DISTMAP: usize = 2;
+
         for i in 0..LIGHTLEVELS {
             let startmap = ((LIGHTLEVELS - 1 - i) * 2) * NUMCOLORMAPS / LIGHTLEVELS;
+
+            // scalelight: iluminacao de paredes baseada na escala (rw_scale)
+            // C original: level = startmap - j*SCREENWIDTH/(viewwidth<<detailshift)/DISTMAP
+            // Com viewwidth=SCREENWIDTH=320, detailshift=0: level = startmap - j/2
             for j in 0..MAXLIGHTSCALE {
-                let level = startmap.saturating_sub(j * SCREENWIDTH / (MAXLIGHTSCALE * SCREENWIDTH));
+                let level = startmap.saturating_sub(j / DISTMAP);
                 let clamped = level.min(NUMCOLORMAPS - 1);
                 self.scalelight[i][j] = clamped * 256;
             }
 
+            // zlight: iluminacao de flats baseada na profundidade (distancia Z)
+            // C original: scale = FixedDiv((SCREENWIDTH/2*FRACUNIT), (j+1)<<LIGHTZSHIFT)
+            //             scale >>= LIGHTSCALESHIFT
+            //             level = startmap - scale/DISTMAP
+            // Simplifica para: level = startmap - (SCREENWIDTH/2)/((j+1)*DISTMAP)
             for j in 0..MAXLIGHTZ {
-                let scale = (SCREENWIDTH / 2).checked_div(j).unwrap_or(SCREENWIDTH / 2);
-                let level = startmap.saturating_sub(scale / (SCREENWIDTH / MAXLIGHTZ));
+                let scale = (SCREENWIDTH / 2) / (j + 1);
+                let level = startmap.saturating_sub(scale / DISTMAP);
                 let clamped = level.min(NUMCOLORMAPS - 1);
                 self.zlight[i][j] = clamped * 256;
             }
@@ -419,8 +448,12 @@ fn fine_tangent(angle: usize) -> Fixed {
     ft(angle)
 }
 
-/// Bits para lookup em tantoangle (DBITS = 19).
-const DBITS: i32 = ANGLETOFINESHIFT as i32;
+/// Bits para lookup em tantoangle.
+///
+/// C original: `#define DBITS (FRACBITS-SLOPEBITS)` = 16 - 11 = 5
+/// SLOPEBITS=11 define a precisao da tabela tantoangle (2048 entradas).
+/// O shift converte o resultado de FixedDiv para um indice na tabela.
+const DBITS: i32 = FRACBITS - 11; // FRACBITS - SLOPEBITS = 5
 
 /// Numero de colormaps disponivel.
 const NUMCOLORMAPS: usize = 32;
@@ -434,7 +467,7 @@ mod tests {
     fn render_state_init() {
         let state = RenderState::new();
         assert_eq!(state.centerx, (SCREENWIDTH / 2) as i32);
-        assert_eq!(state.centery, 100);
+        assert_eq!(state.centery, 84); // viewheight/2 = 168/2
         assert!(state.clipangle.0 > 0);
         assert_eq!(state.frame_count, 0);
         assert_eq!(state.valid_count, 1);
@@ -531,5 +564,49 @@ mod tests {
         assert!(state.scalelight[LIGHTLEVELS - 1][MAXLIGHTSCALE - 1] < NUMCOLORMAPS * 256);
         // Nivel de luz minimo, escala minima -> colormap mais escura
         assert!(state.scalelight[0][0] > 0);
+    }
+
+    /// Verifica que `point_to_dist` calcula a distancia correta (hipotenusa).
+    ///
+    /// Com DBITS=5 (FRACBITS - SLOPEBITS), um ponto a 45 graus com
+    /// dx=dy=100 deve retornar ~141 (sqrt(2)*100), nao 100.
+    /// Este teste captura o bug onde DBITS era 19 (ANGLETOFINESHIFT),
+    /// fazendo todos os indices da TAN_TO_ANGLE colapsarem para ~0
+    /// e retornando simplesmente dx ao inves da hipotenusa real.
+    #[test]
+    fn point_to_dist_diagonal() {
+        let mut state = RenderState::new();
+        // Camera na origem olhando para a direita
+        state.viewx = Fixed::ZERO;
+        state.viewy = Fixed::ZERO;
+
+        // Ponto a 45 graus: (100, 100) -> distancia = sqrt(2) * 100 ≈ 141.42
+        let dist = state.point_to_dist(Fixed::from_int(100), Fixed::from_int(100));
+        let dist_int = dist.to_int();
+
+        // Com DBITS=5 correto, deve ser ~141 (tolerancia de ±5 para
+        // imprecisao de ponto-fixo e tabela discretizada).
+        assert!(
+            (136..=146).contains(&dist_int),
+            "point_to_dist(100,100) deveria ser ~141, mas retornou {}",
+            dist_int
+        );
+    }
+
+    /// Verifica que `point_to_dist` retorna dx quando dy=0 (angulo 0).
+    #[test]
+    fn point_to_dist_axis_aligned() {
+        let mut state = RenderState::new();
+        state.viewx = Fixed::ZERO;
+        state.viewy = Fixed::ZERO;
+
+        // Ponto alinhado no eixo X: distancia = dx exato
+        let dist = state.point_to_dist(Fixed::from_int(200), Fixed::ZERO);
+        let dist_int = dist.to_int();
+        assert!(
+            (198..=202).contains(&dist_int),
+            "point_to_dist(200,0) deveria ser ~200, mas retornou {}",
+            dist_int
+        );
     }
 }

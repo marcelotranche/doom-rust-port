@@ -46,6 +46,7 @@
 //! - `info.h` / `info.c` — Tabelas de estados e mobjinfo
 
 pub mod display;
+pub mod doors;
 pub mod events;
 pub mod info;
 pub mod input;
@@ -56,3 +57,4 @@ pub mod state;
 pub mod thinker;
 pub mod tick;
 pub mod ticker;
+pub mod weapons;
