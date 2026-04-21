@@ -3,3 +3,6 @@
 Cargo.lock
 *.wad
 *.WAD
+/images
+trace.log
+*.log

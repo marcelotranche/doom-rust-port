@@ -18,3 +18,16 @@ env_logger = "0.11"
 
 [dev-dependencies]
 assert_matches = "1"
+
+# Otimizacoes de release: LTO para inlining cross-crate,
+# codegen-units=1 para melhor otimizacao global,
+# opt-level=3 (padrao em release, explicito por clareza)
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Habilitar otimizacoes no build de dev para deps (SDL2, etc)
+# mantendo debug info para o nosso codigo
+[profile.dev.package."*"]
+opt-level = 2

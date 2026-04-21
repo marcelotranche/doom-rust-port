@@ -167,11 +167,19 @@ impl Div for Fixed {
     fn div(self, rhs: Self) -> Self {
         if rhs.0 == 0 {
             // O DOOM original retornava um valor fixo em caso de overflow.
-            // Aqui retornamos o maximo com o sinal correto.
             if self.0 >= 0 {
                 Fixed::MAX
             } else {
                 Fixed::MIN
+            }
+        } else if (self.0.abs() >> 14) >= rhs.0.abs() {
+            // Protecao contra overflow: se o resultado excederia ~30 bits,
+            // retornar MIN/MAX com sinal correto.
+            // C original: `if ((abs(a)>>14) >= abs(b)) return (a^b)<0 ? MININT : MAXINT;`
+            if (self.0 ^ rhs.0) < 0 {
+                Fixed::MIN
+            } else {
+                Fixed::MAX
             }
         } else {
             Fixed((((self.0 as i64) << FRACBITS) / rhs.0 as i64) as i32)

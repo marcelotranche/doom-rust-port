@@ -204,22 +204,36 @@ impl ColumnDrawer {
         let fracstep = iscale.0;
         let mut frac = texturemid.0 + (yl - self.center_y) * fracstep;
 
-        // Mascara para wrap da textura: source.len() e potencia de 2
-        let tex_mask = if source.len().is_power_of_two() {
-            source.len() - 1
+        // Mascara para wrap da textura: source.len() e potencia de 2.
+        // C original: usa `& 127` (texturas de parede sao 128 pixels de altura)
+        // mas para texturas nao-potencia-de-2, usamos modulo para seguranca.
+        let tex_len = source.len();
+        let tex_mask = if tex_len.is_power_of_two() && tex_len > 0 {
+            tex_len - 1
         } else {
-            127
+            0 // sentinela: usar modulo ao inves de mascara
         };
 
         let mut dest_offset = dest_start;
-        for _ in 0..=count {
-            // Buscar texel e aplicar iluminacao
-            let texel_index = ((frac >> FRACBITS) as usize) & tex_mask;
-            let texel = source[texel_index];
-            screen[dest_offset] = colormap[texel as usize];
-
-            dest_offset += SCREENWIDTH;
-            frac += fracstep;
+        // Separar loops para evitar branch no inner loop (hot path)
+        if tex_mask != 0 {
+            // Fast path: potencia de 2 — bitmask (maioria das texturas)
+            for _ in 0..=count {
+                let texel_index = (frac >> FRACBITS) as usize & tex_mask;
+                let texel = source[texel_index];
+                screen[dest_offset] = colormap[texel as usize];
+                dest_offset += SCREENWIDTH;
+                frac += fracstep;
+            }
+        } else if tex_len > 0 {
+            // Slow path: texturas nao-potencia-de-2 — modulo
+            for _ in 0..=count {
+                let texel_index = (frac >> FRACBITS) as usize % tex_len;
+                let texel = source[texel_index];
+                screen[dest_offset] = colormap[texel as usize];
+                dest_offset += SCREENWIDTH;
+                frac += fracstep;
+            }
         }
     }
 

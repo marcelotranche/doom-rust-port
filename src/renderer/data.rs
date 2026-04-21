@@ -140,6 +140,10 @@ pub struct TextureData {
     /// 34 tabelas de 256 bytes cada (32 niveis + fullbright + invulnerability).
     /// C original: `lighttable_t* colormaps` em `r_data.c`
     pub colormaps: Vec<u8>,
+
+    /// Cache de nome de textura -> indice para lookup O(1).
+    /// Evita busca linear em texture_num_for_name().
+    texture_name_map: std::collections::HashMap<[u8; 8], usize>,
 }
 
 impl TextureData {
@@ -187,6 +191,16 @@ impl TextureData {
             num_sprite_lumps,
         );
 
+        // Construir cache de nome -> indice para lookup O(1)
+        let mut texture_name_map = std::collections::HashMap::with_capacity(num_textures);
+        for (i, tex) in textures.iter().enumerate() {
+            let mut key = tex.name;
+            for b in &mut key {
+                *b = b.to_ascii_uppercase();
+            }
+            texture_name_map.insert(key, i);
+        }
+
         Ok(TextureData {
             textures,
             texture_height,
@@ -202,6 +216,7 @@ impl TextureData {
             sprite_offset,
             sprite_top_offset,
             colormaps,
+            texture_name_map,
         })
     }
 
@@ -380,21 +395,11 @@ impl TextureData {
     ///
     /// C original: `R_TextureNumForName()` em `r_data.c`
     pub fn texture_num_for_name(&self, name: &str) -> Option<usize> {
-        let search = {
-            let mut buf = [0u8; 8];
-            for (i, b) in name.bytes().take(8).enumerate() {
-                buf[i] = b.to_ascii_uppercase();
-            }
-            buf
-        };
-
-        self.textures.iter().position(|t| {
-            let mut t_name = t.name;
-            for b in &mut t_name {
-                *b = b.to_ascii_uppercase();
-            }
-            t_name == search
-        })
+        let mut search = [0u8; 8];
+        for (i, b) in name.bytes().take(8).enumerate() {
+            search[i] = b.to_ascii_uppercase();
+        }
+        self.texture_name_map.get(&search).copied()
     }
 
     /// Retorna o indice do lump de um flat pelo nome.
@@ -633,6 +638,9 @@ mod tests {
             patches: vec![],
         };
 
+        let mut texture_name_map = std::collections::HashMap::new();
+        texture_name_map.insert(*b"STARTAN3", 0);
+
         let td = TextureData {
             textures: vec![tex],
             texture_height: vec![Fixed(128 << FRACBITS)],
@@ -648,6 +656,7 @@ mod tests {
             sprite_offset: vec![],
             sprite_top_offset: vec![],
             colormaps: vec![],
+            texture_name_map,
         };
 
         assert_eq!(td.texture_num_for_name("STARTAN3"), Some(0));

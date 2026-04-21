@@ -356,13 +356,15 @@ impl MapData {
                 Some(side1 as usize)
             };
 
-            // Determinar sectors frontal e traseiro via sidedefs
-            // C original: `ld->frontsector = sides[ld->sidenum[0]].sector`
-            let front_sector = sidenum0.map(|i| sidedefs[i].sector_index);
-            let back_sector = sidenum1.map(|i| sidedefs[i].sector_index);
-
             let flags =
                 LineDefFlags::from_bits_truncate(flags_raw);
+
+            // Determinar sectors frontal e traseiro via sidedefs
+            // C original: `ld->frontsector = sides[ld->sidenum[0]].sector`
+            // C original: `if (sidenum[1] != -1) backsector = sides[sidenum[1]].sector`
+            // backsector e definido por sidenum[1], nao pela flag TWO_SIDED
+            let front_sector = sidenum0.map(|i| sidedefs[i].sector_index);
+            let back_sector = sidenum1.map(|i| sidedefs[i].sector_index);
 
             // dx/dy e slope_type serao calculados em finalize()
             // quando os vertices estiverem disponiveis

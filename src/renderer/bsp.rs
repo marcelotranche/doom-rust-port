@@ -270,14 +270,27 @@ impl BspTraversal {
             {
                 self.clip_solid_wall_segment(x1, x2 - 1);
             }
-            // Janela (alturas diferentes) ou luz diferente — parede parcial
+            // Janela: alturas diferentes
             else if back.ceiling_height != front.ceiling_height
                 || back.floor_height != front.floor_height
-                || front.light_level != back.light_level
             {
                 self.clip_pass_wall_segment(x1, x2 - 1);
             }
-            // Setores identicos (mesma altura, luz) — trigger line, ignorar
+            // Mesmas alturas: rejeitar APENAS se tudo for identico
+            // (textures iguais, luz igual, sem mid texture)
+            // C original: r_bsp.c linhas 336-347
+            else {
+                let sidedef = &map.sidedefs[seg.sidedef];
+                let has_mid = sidedef.mid_texture[0] != b'-' && sidedef.mid_texture[0] != 0;
+                if back.ceiling_pic != front.ceiling_pic
+                    || back.floor_pic != front.floor_pic
+                    || back.light_level != front.light_level
+                    || has_mid
+                {
+                    self.clip_pass_wall_segment(x1, x2 - 1);
+                }
+                // Tudo identico e sem mid texture — trigger line, ignorar
+            }
         } else {
             // One-sided = parede solida
             self.clip_solid_wall_segment(x1, x2 - 1);
