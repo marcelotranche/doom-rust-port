@@ -1,8 +1,10 @@
 /references
 /target
+/assets
+/images
 Cargo.lock
+.claude/settings.local.json
+trace.log
 *.wad
 *.WAD
-/images
-trace.log
 *.log
