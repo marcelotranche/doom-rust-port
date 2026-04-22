@@ -367,6 +367,9 @@ código-fonte e ao `CLAUDE.md` (contexto de IA do projeto):
 |---------|----------|
 | [`docs/architecture.md`](docs/architecture.md) | Visão geral da arquitetura do DOOM original — estatísticas por subsistema, diagrama de dependências entre os módulos C (`p_*`, `r_*`, `g_*`, `s_*`, `w_*`, `m_*`, `z_*`) e LOC aproximado de cada um. Use como mapa mental antes de navegar o código. |
 | [`docs/glossary.md`](docs/glossary.md) | Glossário dos termos técnicos do engine DOOM (WAD, IWAD, PWAD, lump, patch, BSP, sector, linedef, thinker, fixed-point, angle_t...) e da linguagem Rust aplicada ao port (ownership, trait objects, `Vec<Box<dyn T>>`, etc.). Referência rápida ao encontrar jargão. |
+| [`docs/rust-idiomatic.md`](docs/rust-idiomatic.md) | Explicação didática dos quatro pilares do Rust — **ownership**, **borrow checker**, **enums algébricos** e **traits** — com exemplos extraídos do port. Leitura recomendada antes de mergulhar no código-fonte. |
+| [`docs/rust-glossary.md`](docs/rust-glossary.md) | Mini-glossário de **termos da linguagem Rust** (ownership, lifetime, trait, enum, `Box<dyn T>`, `Option`, `Result`, macros, ferramentas, jargão). Referência rápida para decodificar sintaxe e terminologia. |
+| [`docs/rust-learning-guide.md`](docs/rust-learning-guide.md) | Mini-guia de aprendizado Rust em **sete etapas** — do `Hello, world` a tópicos avançados. Inclui exercícios, indicadores de progresso e como usar este próprio repositório como material de estudo C → Rust. |
 | [`docs/docker-guide.md`](docs/docker-guide.md) | Guia passo-a-passo para compilar e executar o port em contêiner Docker, sem instalar Rust ou SDL2 na máquina host. Inclui pré-requisitos, obtenção de IWAD e exemplos de execução. |
 | [`docs/modules/`](docs/modules/) | Pasta reservada para documentação por módulo individual (a ser populada conforme cada subsistema Rust for aprofundado). |
 
@@ -435,7 +438,7 @@ o C original) e permitiu que cada fase fosse conduzida com consistência
 
 ## Licença
 
-Código do port: MIT / Apache-2.0 (a definir).
+Código do port: **GPL v2** (ver [`LICENSE`](LICENSE)).
 
 DOOM original: GPL v2 (id Software, 1997).
 Freedoom (assets): BSD-style.
